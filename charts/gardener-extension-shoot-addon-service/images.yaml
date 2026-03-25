@@ -1,0 +1,4 @@
+images:
+  - name: gardener-extension-shoot-addon-service
+    repository: ghcr.io/amendezsap/gardener-extension-shoot-addon-service
+    tag: "0.1.0"

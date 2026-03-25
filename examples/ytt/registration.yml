@@ -1,0 +1,37 @@
+#@ load("@ytt:data", "data")
+
+#! Extension registration for gardener-extension-shoot-addon-service.
+#!
+#! Lifecycle DAG ordering:
+#!   Infrastructure -> Extension(shoot-addon-service) -> Worker
+#!
+#! The extension runs AFTER Infrastructure (needs VPC ID for endpoints)
+#! and BEFORE Worker (so addons are ready when nodes join).
+
+---
+apiVersion: core.gardener.cloud/v1beta1
+kind: ControllerRegistration
+metadata:
+  name: shoot-addon-service
+spec:
+  resources:
+    - kind: Extension
+      type: shoot-addon-service
+      globallyEnabled: #@ data.values.globally_enabled
+  deployment:
+    deploymentRefs:
+      - name: shoot-addon-service
+---
+apiVersion: core.gardener.cloud/v1beta1
+kind: ControllerDeployment
+metadata:
+  name: shoot-addon-service
+spec:
+  type: helm
+  providerConfig:
+    chart: #@ "oci://{}/charts/gardener-extension-shoot-addon-service:{}".format(data.values.registry, data.values.version)
+    values:
+      image:
+        repository: #@ "{}/gardener-extension-shoot-addon-service".format(data.values.registry)
+        tag: #@ data.values.image_tag if data.values.image_tag else data.values.version
+      deploymentPolicy: #@ data.values.deployment_policy

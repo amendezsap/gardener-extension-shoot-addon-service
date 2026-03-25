@@ -1,0 +1,7 @@
+#@data/values
+---
+version: "0.1.0"
+image_tag: ""
+registry: "ghcr.io/amendezsap"
+globally_enabled: false
+deployment_policy: "Always"

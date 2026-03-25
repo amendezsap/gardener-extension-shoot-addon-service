@@ -1,0 +1,8 @@
+*.tgz
+.claude/
+.idea/
+.vscode/
+addon-prepare
+bin/
+list-containers
+vendor/

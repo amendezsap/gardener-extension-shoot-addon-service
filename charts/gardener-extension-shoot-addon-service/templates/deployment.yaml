@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gardener-extension-shoot-addon-service
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gardener-extension-shoot-addon-service
+    app.kubernetes.io/instance: shoot-addon-service
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gardener-extension-shoot-addon-service
+      app.kubernetes.io/instance: shoot-addon-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gardener-extension-shoot-addon-service
+        app.kubernetes.io/instance: shoot-addon-service
+        networking.gardener.cloud/to-runtime-apiserver: allowed
+        networking.gardener.cloud/to-public-networks: allowed
+        networking.gardener.cloud/to-private-networks: allowed
+        networking.gardener.cloud/to-dns: allowed
+        networking.resources.gardener.cloud/to-garden-virtual-garden-kube-apiserver-tcp-443: allowed
+    spec:
+      serviceAccountName: gardener-extension-shoot-addon-service
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: gardener-extension-shoot-addon-service
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --leader-elect=true
+          env:
+            - name: NAMESPACES
+              value: {{ join "," .Values.grmNamespaces | quote }}
+            - name: DEFAULT_VPC_ENDPOINT_ENABLED
+              value: {{ .Values.defaults.aws.vpcEndpoint.enabled | quote }}
+            {{- range $addon, $override := .Values.addonImageOverrides }}
+            {{- $upperName := upper (replace "-" "_" $addon) }}
+            {{- if $override.repository }}
+            - name: ADDON_{{ $upperName }}_IMAGE_REPOSITORY
+              value: {{ $override.repository | quote }}
+            {{- end }}
+            {{- if $override.tag }}
+            - name: ADDON_{{ $upperName }}_IMAGE_TAG
+              value: {{ $override.tag | quote }}
+            {{- end }}
+            {{- end }}
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

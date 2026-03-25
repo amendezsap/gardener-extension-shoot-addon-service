@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shoot-addon-admission
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: shoot-addon-admission
+    app.kubernetes.io/instance: shoot-addon-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: shoot-addon-admission
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: shoot-addon-admission
+        app.kubernetes.io/instance: shoot-addon-service
+        networking.gardener.cloud/to-runtime-apiserver: allowed
+        networking.gardener.cloud/to-dns: allowed
+    spec:
+      serviceAccountName: gardener-extension-shoot-addon-service
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: shoot-addon-admission
+          image: "{{ .Values.admission.image.repository }}:{{ .Values.admission.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --webhook-config-server-port=10250
+            - --webhook-config-mode=service
+            - --webhook-config-namespace={{ .Release.Namespace }}
+            - --health-bind-address=:8082
+            - --leader-election-id=shoot-addon-admission
+          env:
+            - name: NAMESPACES
+              value: {{ join "," .Values.grmNamespaces | quote }}
+            - name: WEBHOOK_CONFIG_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: LEADER_ELECTION_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: webhook
+              containerPort: 10250
+              protocol: TCP
+            - name: health
+              containerPort: 8082
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi

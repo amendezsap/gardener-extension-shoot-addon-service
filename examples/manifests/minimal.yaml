@@ -1,0 +1,9 @@
+apiVersion: addons.gardener.cloud/v1alpha1
+kind: AddonManifest
+defaultNamespace: observability
+addons:
+  - name: fluent-bit
+    chart:
+      path: fluent-bit/chart
+    valuesPath: fluent-bit/values
+    enabled: true

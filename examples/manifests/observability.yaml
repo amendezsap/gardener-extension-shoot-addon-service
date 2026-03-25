@@ -1,0 +1,30 @@
+apiVersion: addons.gardener.cloud/v1alpha1
+kind: AddonManifest
+defaultNamespace: observability
+
+# Global AWS — node-level policies (provider-aws only, skipped on other providers)
+globalAWS:
+  iamPolicies:
+    - CloudWatchAgentServerPolicy
+    - service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+addons:
+  - name: fluent-bit
+    chart:
+      oci: oci://ghcr.io/fluent/helm-charts/fluent-bit
+      version: "0.56.0"
+    valuesPath: fluent-bit/values
+    enabled: true
+    shootValues:
+      fullnameOverride: addon-fluent-bit
+    image:
+      valuesKey: image
+    aws:
+      vpcEndpoint:
+        service: logs
+
+  - name: container-report
+    chart:
+      path: container-report/chart
+    valuesPath: container-report/values
+    enabled: false

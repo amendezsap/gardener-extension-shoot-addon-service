@@ -1,0 +1,6 @@
+apiVersion: v2
+name: gardener-extension-admission-shoot-addon-service
+description: Admission webhook for shoot-addon-service (GRM namespace provisioner)
+version: 0.1.0
+appVersion: "0.1.0"
+type: application

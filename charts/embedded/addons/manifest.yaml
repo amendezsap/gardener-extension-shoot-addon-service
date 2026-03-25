@@ -1,0 +1,48 @@
+# Addon Manifest for gardener-extension-shoot-addon-service
+# Copy this to charts/embedded/addons/manifest.yaml in the extension repo before building.
+apiVersion: addons.gardener.cloud/v1alpha1
+kind: AddonManifest
+
+defaultNamespace: managed-resources
+
+globalAWS:
+  iamPolicies:
+    - CloudWatchAgentServerPolicy
+    - service-role/AmazonAPIGatewayPushToCloudWatchLogs
+    - AmazonSSMManagedInstanceCore
+  vpcEndpoints:
+    - service: logs
+
+addons:
+  - name: fluent-bit
+    chart:
+      path: fluent-bit/chart
+    valuesPath: fluent-bit/values
+    enabled: true
+    target: global
+    managedResourceName: fluent-bit
+    shootValues:
+      fullnameOverride: fluent-bit
+      env:
+        - name: REGION
+          value: "{{ .Region }}"
+        - name: SEEDNAME
+          value: "{{ .SeedName }}"
+        - name: NODENAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+    image:
+      valuesKey: image
+
+  - name: container-report
+    chart:
+      path: container-report/chart
+    valuesPath: container-report/values
+    enabled: true
+    target: global
+    managedResourceName: container-report
+    shootValues:
+      fullnameOverride: running-container-report
+    image:
+      valuesKey: image

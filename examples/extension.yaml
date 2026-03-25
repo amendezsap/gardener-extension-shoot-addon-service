@@ -1,0 +1,55 @@
+# Example operator.gardener.cloud Extension manifest for shoot-addon-service.
+#
+# Apply to the RUNTIME cluster:
+#   kubectl apply -f extension.yaml
+#
+# The admission webhook pod deploys to the SEED (in the extension namespace),
+# NOT to the runtime cluster. Both controller and admission are in the same
+# Helm chart deployed via spec.deployment.extension.
+apiVersion: operator.gardener.cloud/v1alpha1
+kind: Extension
+metadata:
+  name: extension-shoot-addon-service
+spec:
+  deployment:
+    extension:
+      helm:
+        ociRepository:
+          ref: ghcr.io/amendezsap/charts/gardener-extension-shoot-addon-service:0.1.0
+      # Enable garden API access for the controller pod. This allows the
+      # extension to trigger shoot reconciles after fixing stale GRM configs.
+      injectGardenKubeconfig: true
+      values:
+        image:
+          repository: ghcr.io/amendezsap/gardener-extension-shoot-addon-service
+          tag: "0.1.0"
+        admission:
+          image:
+            repository: ghcr.io/amendezsap/gardener-extension-admission-shoot-addon-service
+            tag: "0.1.0"
+        # Controller defaults — applied when a shoot has no providerConfig.
+        defaults:
+          aws:
+            vpcEndpoint:
+              enabled: false
+        # Namespaces to inject into the GRM ConfigMap so it watches them.
+        grmNamespaces:
+          - managed-resources
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+  resources:
+    - kind: Extension
+      type: shoot-addon-service
+      primary: true
+      # Uncomment to auto-enable for all shoots:
+      # autoEnable:
+      #   - shoot
+      lifecycle:
+        reconcile: AfterKubeAPIServer
+        delete: BeforeKubeAPIServer
+        migrate: BeforeKubeAPIServer

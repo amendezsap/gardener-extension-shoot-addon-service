@@ -1,0 +1,25 @@
+version = 1
+
+[[annotations]]
+path = [
+  "*.go",
+  "go.mod",
+  "go.sum",
+  "Makefile",
+  "Dockerfile",
+  "VERSION",
+  ".gitignore",
+  "charts/gardener-extension-shoot-addon-service/**",
+  "charts/embedded/**",
+  "cmd/**",
+  "pkg/**",
+  "examples/**",
+  "README.md",
+]
+SPDX-FileCopyrightText = "SAP SE or an SAP affiliate company and contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = "LICENSES/**"
+SPDX-FileCopyrightText = "SAP SE or an SAP affiliate company and contributors"
+SPDX-License-Identifier = "Apache-2.0"

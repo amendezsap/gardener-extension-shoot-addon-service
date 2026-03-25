@@ -1,0 +1,12 @@
+# AWS-specific values for Fluent Bit CloudWatch output.
+# Merged on top of values.yaml when the shoot is on AWS.
+config:
+  outputs: |
+    [OUTPUT]
+        Name                cloudwatch_logs
+        Match               *
+        region              ${REGION}
+        log_group_name      /aws/containerinsights/${SEEDNAME}/application
+        log_stream_prefix   ${NODENAME}-
+        auto_create_group   true
+        net.dns.resolver    LEGACY

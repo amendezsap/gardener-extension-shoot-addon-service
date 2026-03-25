@@ -1,0 +1,5 @@
+apiVersion: v2
+name: runtime
+description: Runtime chart for admission webhook deployment
+version: 0.1.0
+type: application

@@ -1,0 +1,19 @@
+image:
+  repository: ghcr.io/amendezsap/list-containers
+  tag: "v1.0.0"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+schedule: "*/30 * * * *"
+successfulJobsHistoryLimit: 3
+
+args:
+  - --sha256
+
+serviceAccount:
+  name: container-report-sa
+
+networkLabels:
+  networking.gardener.cloud/to-runtime-apiserver: allowed
+  networking.gardener.cloud/to-dns: allowed

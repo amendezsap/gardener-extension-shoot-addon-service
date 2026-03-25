@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: gardener-extension-{{ .Values.admission.webhookName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: shoot-addon-admission
+    app.kubernetes.io/instance: shoot-addon-service
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: shoot-addon-admission
+  ports:
+    - name: webhook
+      port: 443
+      targetPort: 10250
+      protocol: TCP

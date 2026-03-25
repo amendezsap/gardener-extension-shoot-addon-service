@@ -1,0 +1,46 @@
+image:
+  repository: ghcr.io/amendezsap/gardener-extension-shoot-addon-service
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+# Admission webhook pod (separate from controller, always ready)
+admission:
+  image:
+    repository: ghcr.io/amendezsap/gardener-extension-admission-shoot-addon-service
+    tag: "0.1.0"
+  # This MUST match the Go Name constant in cmd/gardener-extension-admission-shoot-addon-service/app/app.go.
+  # The Gardener webhook framework generates:
+  #   - Service name:      "gardener-extension-<webhookName>"
+  #   - Cert bundle label: "ca-<webhookName>-webhook-bundle"
+  #
+  # The cert bundle name is used as a Kubernetes label VALUE (max 63 chars).
+  # Formula: "ca-" + webhookName + "-webhook-bundle" = 3 + len + 15 = len + 18
+  # So webhookName must be <= 45 chars. Current value is 30 chars.
+  # DO NOT exceed 45 characters or cert generation will fail silently.
+  webhookName: extension-admission-shoot-addon
+
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+# Controller defaults — applied when a shoot has no providerConfig.
+defaults:
+  aws:
+    vpcEndpoint:
+      enabled: false
+
+# GRM namespace provisioner — the admission webhook adds these namespaces
+# to the GRM ConfigMap's targetClientConnection.namespaces list.
+grmNamespaces:
+  - observability
+
+# Per-addon image overrides.
+addonImageOverrides: {}
+
+imagePullSecrets: []

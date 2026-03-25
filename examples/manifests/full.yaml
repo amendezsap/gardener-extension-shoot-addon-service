@@ -1,0 +1,46 @@
+apiVersion: addons.gardener.cloud/v1alpha1
+kind: AddonManifest
+defaultNamespace: observability
+
+# Global AWS — node-level policies (provider-aws only, skipped on other providers)
+globalAWS:
+  iamPolicies:
+    - CloudWatchAgentServerPolicy
+    - service-role/AmazonAPIGatewayPushToCloudWatchLogs
+    - AmazonSSMManagedInstanceCore
+
+addons:
+  # OCI chart source — pulled at build time from ghcr.io
+  - name: fluent-bit
+    chart:
+      oci: oci://ghcr.io/fluent/helm-charts/fluent-bit
+      version: "0.56.0"
+    valuesPath: fluent-bit/values
+    enabled: true
+    shootValues:
+      fullnameOverride: addon-fluent-bit
+    image:
+      valuesKey: image
+    aws:
+      vpcEndpoint:
+        service: logs
+
+  # Git chart source — pulled at build time from GitHub
+  - name: container-report
+    chart:
+      git: https://github.com/amendezsap/charts
+      gitPath: shoot-addon-service/container-report
+      gitRef: main
+    valuesPath: container-report/values
+    enabled: false
+
+  # Helm repo chart source — pulled at build time from upstream repo
+  - name: nginx-ingress
+    chart:
+      repo: https://kubernetes.github.io/ingress-nginx
+      repoChart: ingress-nginx
+      version: "4.12.1"
+    namespace: ingress-nginx
+    enabled: false
+    image:
+      valuesKey: controller.image

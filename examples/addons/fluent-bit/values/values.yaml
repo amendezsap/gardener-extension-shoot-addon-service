@@ -1,0 +1,23 @@
+# Example Fluent Bit values for CloudWatch log forwarding.
+# Copy to charts/embedded/addons/fluent-bit/values/ before building.
+daemonSetVolumes:
+  - name: varlog
+    hostPath:
+      path: /var/log
+  - name: varlibdockercontainers
+    hostPath:
+      path: /var/lib/docker/containers
+  - name: varlogfluentbitstate
+    hostPath:
+      path: /var/fluent-bit/state
+      type: DirectoryOrCreate
+
+daemonSetVolumeMounts:
+  - name: varlog
+    mountPath: /var/log
+    readOnly: false
+  - name: varlibdockercontainers
+    mountPath: /var/lib/docker/containers
+    readOnly: true
+  - name: varlogfluentbitstate
+    mountPath: /var/fluent-bit/state

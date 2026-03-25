@@ -1,0 +1,6 @@
+gardener:
+  virtualCluster:
+    enabled: true
+    serviceAccount: {}
+#     name: gardener-extension-admission-shoot-addon-service
+#     namespace: kube-system

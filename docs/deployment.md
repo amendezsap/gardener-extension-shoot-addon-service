@@ -22,30 +22,46 @@ How to build, push, and deploy the extension to a Gardener landscape.
 
 ## Building Images
 
-The extension uses [ko](https://ko.build/) to build container images directly from Go source. No Dockerfiles needed.
+The extension uses [ko](https://ko.build/) to build container images directly from Go source. No Dockerfiles needed. The binary ships bare -- `charts/embedded/addons/` is empty by default. The same binary works in every environment; addon configuration is provided at deploy time via the Extension CR.
 
 ```bash
 # Build and push controller image
-KO_DOCKER_REPO=ghcr.io/your-org/gardener-extension-shoot-addon-service \
+KO_DOCKER_REPO=registry.example.com/your-org/gardener-extension-shoot-addon-service \
   ko build --bare --tags v0.1.0 ./cmd/gardener-extension-shoot-addon-service
 
 # Build and push admission webhook image
-KO_DOCKER_REPO=ghcr.io/your-org/gardener-extension-admission-shoot-addon-service \
+KO_DOCKER_REPO=registry.example.com/your-org/gardener-extension-admission-shoot-addon-service \
   ko build --bare --tags v0.1.0 ./cmd/gardener-extension-admission-shoot-addon-service
 ```
+
+### Self-Contained Builds
+
+If you need a fully self-contained binary with embedded charts (no runtime OCI pulls), populate `charts/embedded/addons/` before building:
+
+```bash
+# Pull charts into the embedded directory
+make pull-chart NAME=fluent-bit \
+  OCI=oci://registry.example.com/charts/fluent-bit \
+  VERSION=0.56.0
+
+# Build -- charts are compiled into the binary via go:embed
+make release REGISTRY=registry.example.com/your-org TAG=v0.1.0
+```
+
+The extension uses a fallback chain: ConfigMap (runtime) -> embedded -> nothing. Self-contained builds still respect runtime ConfigMap config if present.
 
 ### Custom Base Image
 
 By default, ko uses `gcr.io/distroless/static`. For air-gapped environments, override the base image:
 
 ```bash
-export KO_DEFAULTBASEIMAGE=my-registry.example.com/distroless/static:nonroot
+export KO_DEFAULTBASEIMAGE=registry.example.com/distroless/static:nonroot
 ```
 
 Or create a `.ko.yaml` file (not committed to the repo):
 
 ```yaml
-defaultBaseImage: my-registry.example.com/distroless/static:nonroot
+defaultBaseImage: registry.example.com/distroless/static:nonroot
 ```
 
 ## Pushing to a Registry
@@ -73,7 +89,7 @@ make release REGISTRY=ghcr.io/your-org TAG=v0.1.0
 
 ### Operator Extension
 
-Create an `operator.gardener.cloud/v1alpha1` Extension resource on the **runtime cluster**:
+Create an `operator.gardener.cloud/v1alpha1` Extension resource on the **runtime cluster**. The `values.addons` section defines which charts to pull and deploy -- this is the primary configuration method.
 
 ```yaml
 apiVersion: operator.gardener.cloud/v1alpha1
@@ -85,15 +101,15 @@ spec:
     extension:
       helm:
         ociRepository:
-          ref: ghcr.io/your-org/charts/gardener-extension-shoot-addon-service:0.1.0
+          ref: registry.example.com/your-org/charts/gardener-extension-shoot-addon-service:0.1.0
       injectGardenKubeconfig: true
       values:
         image:
-          repository: ghcr.io/your-org/gardener-extension-shoot-addon-service
+          repository: registry.example.com/your-org/gardener-extension-shoot-addon-service
           tag: "0.1.0"
         admission:
           image:
-            repository: ghcr.io/your-org/gardener-extension-admission-shoot-addon-service
+            repository: registry.example.com/your-org/gardener-extension-admission-shoot-addon-service
             tag: "0.1.0"
         defaults:
           aws:
@@ -101,6 +117,24 @@ spec:
               enabled: false
         grmNamespaces:
           - managed-resources
+        # Addon configuration -- charts pulled from OCI at runtime
+        addons:
+          fluent-bit:
+            enabled: true
+            chart:
+              oci: oci://registry.example.com/charts/fluent-bit
+              version: "0.56.0"
+            namespace: observability
+            target: global
+            values:
+              fullnameOverride: addon-fluent-bit
+            image:
+              valuesKey: image
+            aws:
+              iamPolicies:
+                - CloudWatchAgentServerPolicy
+              vpcEndpoint:
+                service: logs
   resources:
     - kind: Extension
       type: shoot-addon-service
@@ -121,17 +155,20 @@ kubectl apply -f extension.yaml
 
 The Gardener operator will:
 1. Create a `ControllerRegistration` and `ControllerDeployment` in the virtual garden
-2. Gardenlet installs the extension on each seed via `ControllerInstallation`
-3. The extension reconciles all shoots automatically
+2. The `values.addons` configuration is propagated as a ConfigMap to each seed
+3. Gardenlet installs the extension on each seed via `ControllerInstallation`
+4. The extension reads the ConfigMap, pulls charts from OCI, and reconciles all shoots
+5. On managed seeds, the extension skips seed-targeted addon deployment (the parent handles it)
 
 ### Key Configuration
 
 | Helm Value | Description | Default |
 |---|---|---|
-| `image.repository` | Controller image | `ghcr.io/amendezsap/gardener-extension-shoot-addon-service` |
-| `admission.image.repository` | Admission webhook image | `ghcr.io/amendezsap/gardener-extension-admission-shoot-addon-service` |
+| `image.repository` | Controller image | (none) |
+| `admission.image.repository` | Admission webhook image | (none) |
 | `defaults.aws.vpcEndpoint.enabled` | Create VPC endpoints for shoots | `false` |
 | `grmNamespaces` | Namespaces to inject into GRM config | `["observability"]` |
+| `addons` | Addon definitions (chart refs, values, AWS config) | `{}` |
 | `resources` | Controller pod resource requests/limits | See `values.yaml` |
 | `addonImageOverrides` | Per-addon image overrides | `{}` |
 
@@ -148,35 +185,40 @@ For environments without internet access:
 1. **Mirror images** to your private registry:
    ```bash
    # Controller + admission images
-   crane copy ghcr.io/amendezsap/gardener-extension-shoot-addon-service:0.1.0 \
-     my-registry.example.com/gardener-extension-shoot-addon-service:0.1.0
+   crane copy registry.example.com/gardener-extension-shoot-addon-service:0.1.0 \
+     air-gapped-registry.example.com/gardener-extension-shoot-addon-service:0.1.0
 
-   # Addon images (fluent-bit, etc.)
+   # Addon chart images (fluent-bit, etc.)
    crane copy cr.fluentbit.io/fluent/fluent-bit:3.2.6 \
-     my-registry.example.com/fluent-bit:3.2.6
+     air-gapped-registry.example.com/fluent-bit:3.2.6
    ```
 
-2. **Update addon values** to reference your registry:
-   ```yaml
-   # In addons/fluent-bit/values/values.yaml
-   image:
-     repository: my-registry.example.com/fluent-bit
-   ```
-
-3. **Build with private base image**:
+2. **Mirror addon charts** to your private OCI registry:
    ```bash
-   export KO_DEFAULTBASEIMAGE=my-registry.example.com/distroless/static:nonroot
-   make release REGISTRY=my-registry.example.com TAG=0.1.0
+   # Copy addon Helm charts so the extension can pull them at runtime
+   helm pull oci://registry.example.com/charts/fluent-bit --version 0.56.0
+   helm push fluent-bit-0.56.0.tgz oci://air-gapped-registry.example.com/charts
    ```
 
-4. **Deploy with registry overrides**:
+3. **Build with private base image** (or use self-contained builds with embedded charts):
+   ```bash
+   export KO_DEFAULTBASEIMAGE=air-gapped-registry.example.com/distroless/static:nonroot
+   make release REGISTRY=air-gapped-registry.example.com TAG=0.1.0
+   ```
+
+4. **Deploy with registry overrides** -- point OCI chart refs at your private registry:
    ```yaml
    values:
      image:
-       repository: my-registry.example.com/gardener-extension-shoot-addon-service
+       repository: air-gapped-registry.example.com/gardener-extension-shoot-addon-service
      admission:
        image:
-         repository: my-registry.example.com/gardener-extension-admission-shoot-addon-service
+         repository: air-gapped-registry.example.com/gardener-extension-admission-shoot-addon-service
+     addons:
+       fluent-bit:
+         chart:
+           oci: oci://air-gapped-registry.example.com/charts/fluent-bit
+           version: "0.56.0"
    ```
 
 ## Upgrading

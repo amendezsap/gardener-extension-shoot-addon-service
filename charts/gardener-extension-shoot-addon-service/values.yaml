@@ -44,3 +44,35 @@ grmNamespaces:
 addonImageOverrides: {}
 
 imagePullSecrets: []
+
+# OCI chart cache directory inside the pod filesystem.
+ociChartCacheDir: /tmp/addon-charts
+
+# Runtime addon configuration via ConfigMap.
+# When set, creates a ConfigMap "shoot-addon-service-config" in the extension
+# namespace. The extension reads from this ConfigMap first, falling back to
+# embedded charts if the ConfigMap doesn't exist.
+#
+# addons:
+#   manifest: |
+#     apiVersion: addons.gardener.cloud/v1alpha1
+#     kind: AddonManifest
+#     defaultNamespace: managed-resources
+#     addons:
+#       - name: fluent-bit
+#         chart:
+#           oci: oci://registry.example.com/charts/fluent-bit
+#           version: "0.56.0"
+#         enabled: true
+#         target: global
+#   values:
+#     values.fluent-bit.yaml: |
+#       image:
+#         repository: registry.example.com/fluent-bit
+#         tag: "4.2.3"
+#     values.fluent-bit.aws.yaml: |
+#       config:
+#         outputs: |
+#           [OUTPUT]
+#               Name cloudwatch_logs
+#               ...

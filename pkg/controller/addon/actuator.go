@@ -472,10 +472,17 @@ func (a *actuator) Restore(ctx context.Context, log logr.Logger, ex *extensionsv
 // back to embedded addons if the ConfigMap doesn't exist. Returns the manifest,
 // a map of values files from the ConfigMap (nil if using embedded), and an error.
 func (a *actuator) loadAddonConfig(ctx context.Context, log logr.Logger, namespace string) (*addonpkg.AddonManifest, map[string]string, error) {
+	// The ConfigMap lives in the extension's own namespace (where the controller
+	// pod runs), not in the shoot's control plane namespace.
+	extensionNS := getExtensionNamespace()
+	if extensionNS == "" {
+		extensionNS = namespace
+	}
+
 	cm := &corev1.ConfigMap{}
 	err := a.client.Get(ctx, types.NamespacedName{
 		Name:      ConfigMapName,
-		Namespace: namespace,
+		Namespace: extensionNS,
 	}, cm)
 
 	if err == nil {
@@ -513,6 +520,17 @@ func parseYAMLValues(raw string) (map[string]interface{}, error) {
 		vals = map[string]interface{}{}
 	}
 	return vals, nil
+}
+
+// getExtensionNamespace returns the namespace where the extension controller pod
+// runs. This is where the addon ConfigMap is deployed by the Helm chart.
+func getExtensionNamespace() string {
+	// Try reading from the pod's service account namespace file
+	data, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	if err == nil && len(data) > 0 {
+		return string(data)
+	}
+	return ""
 }
 
 // computeManifestHash returns a short hash of the manifest for change detection.

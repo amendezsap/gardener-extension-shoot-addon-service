@@ -55,13 +55,13 @@ Seed Cluster
 │   └── gardener-extension-admission-shoot-addon-service (admission pod)
 │       ├── No leader election — always running and ready
 │       ├── MutatingWebhookConfiguration for GRM ConfigMaps
-│       ├── Removes targetClientConnection.namespaces restriction at CREATE
+│       ├── Injects required namespaces into targetClientConnection.namespaces at CREATE
 │       └── Enables ManagedResources to deploy to custom namespaces
 ```
 
 **Controller pod** (`cmd/gardener-extension-shoot-addon-service/`): The main reconciliation loop. Watches Extension resources, loads addon config from the seed ConfigMap (falling back to embedded charts), pulls charts from OCI registries, renders them, creates ManagedResources, and manages AWS infrastructure. Participates in leader election like all Gardener extension controllers. On managed seeds, the extension skips seed-targeted addon deployment (the parent seed handles it).
 
-**Admission pod** (`cmd/gardener-extension-admission-shoot-addon-service/`): A dedicated webhook server that intercepts GRM ConfigMap creation and removes the namespace restriction. Runs independently of the controller pod with no leader election dependency, so it is always ready to intercept ConfigMap creates even during controller rollouts or restarts.
+**Admission pod** (`cmd/gardener-extension-admission-shoot-addon-service/`): A dedicated webhook server that intercepts GRM ConfigMap creation and injects required namespaces into the target namespace list. Runs independently of the controller pod with no leader election dependency, so it is always ready to intercept ConfigMap creates even during controller rollouts or restarts.
 
 **Why separate pods?** Gardenlet creates the GRM ConfigMap at step 6 (DeployControlPlane) of the shoot reconciliation DAG. If the webhook lives inside the controller pod, it only becomes ready after leader election completes. During a rollout or pod restart, there is a timing window where the ConfigMap is created before the webhook is registered, causing the namespace restriction to slip through. The admission pod eliminates this race. This is the standard pattern used by provider-aws, ACL, dns-service, cert-service, and all other Gardener extensions that have webhooks.
 
@@ -90,65 +90,37 @@ kubectl apply -f examples/extension.yaml   # edit values.addons first
 
 The Extension CR's `values.addons` section defines which charts to pull from OCI registries and what values to apply. See [examples/extension.yaml](examples/extension.yaml) for the full format.
 
-## Chart Sources
-
-**Runtime (primary):** Specify OCI chart references in the Extension CR's `values.addons` section. Charts are pulled on the seed at runtime.
-
-```yaml
-values:
-  addons:
-    fluent-bit:
-      chart:
-        oci: oci://registry.example.com/charts/fluent-bit
-        version: "0.56.0"
-```
-
-**Embedded (fallback):** For self-contained builds, pull charts into `charts/embedded/addons/` before building:
-
-```bash
-make pull-chart NAME=fluent-bit \
-  OCI=oci://registry.example.com/charts/fluent-bit \
-  VERSION=0.56.0
-```
-
 ## Addon Configuration
 
-Addons are configured in the Extension CR's `values.addons` section. The operator propagates this as a ConfigMap to each seed.
+Addons are configured in the Extension CR's `values.addons` section. This creates a ConfigMap on each seed with the manifest and values. The extension reads the ConfigMap and pulls charts from OCI registries at runtime.
 
 ```yaml
 values:
   addons:
-    fluent-bit:
-      enabled: true
-      chart:
-        oci: oci://registry.example.com/charts/fluent-bit
-        version: "0.56.0"
-      namespace: observability
-      values:
-        fullnameOverride: addon-fluent-bit
-      aws:
+    manifest: |
+      apiVersion: addons.gardener.cloud/v1alpha1
+      kind: AddonManifest
+      defaultNamespace: observability
+      globalAWS:
         iamPolicies:
           - CloudWatchAgentServerPolicy
-        vpcEndpoint:
-          service: logs
+        vpcEndpoints:
+          - service: logs
+      addons:
+        - name: fluent-bit
+          chart:
+            oci: oci://registry.example.com/charts/fluent-bit
+            version: "0.56.0"
+          enabled: true
+          target: global
+    values:
+      values.fluent-bit.yaml: |
+        image:
+          repository: registry.example.com/fluent-bit
+          tag: "4.2.3"
 ```
 
-For self-contained builds, addons can also be declared in `charts/embedded/addons/manifest.yaml` (see the embedded fallback method in [docs/usage.md](docs/usage.md)).
-
-## Directory Structure
-
-```
-charts/embedded/addons/           # Empty by default — used only for embedded builds
-├── manifest.yaml                 # declares what to deploy (embedded method only)
-├── fluent-bit/                   # one directory per addon
-│   ├── chart/                    # the Helm chart (pulled via make pull-chart)
-│   └── values/                   # your values overlays
-└── another-addon/
-    ├── chart/
-    └── values/
-```
-
-For runtime config (recommended), addon definitions live in the Extension CR -- this directory stays empty.
+For self-contained builds, addons can also be embedded at build time — see the [usage guide](docs/usage.md) for the embedded fallback method.
 
 ## Per-Shoot Configuration
 
@@ -192,13 +164,11 @@ globalAWS:
     - AmazonSSMManagedInstanceCore
 ```
 
-**Per-Addon VPC Endpoints** — created in the shoot's VPC with the Gardener node security group:
+**Global VPC Endpoints** — created in the shoot's VPC with the Gardener node security group. Configured in the manifest's `globalAWS` section (not per-addon):
 ```yaml
-addons:
-  - name: fluent-bit
-    aws:
-      vpcEndpoint:
-        service: logs    # → com.amazonaws.<region>.logs
+globalAWS:
+  vpcEndpoints:
+    - service: logs    # → com.amazonaws.<region>.logs
 ```
 
 VPC endpoints support shared VPCs (tag-based tracking prevents premature deletion) and are configurable per-shoot via `providerConfig`.
@@ -209,28 +179,16 @@ IAM policies removed from `globalAWS.iamPolicies` are automatically detached on 
 
 For each addon, values are merged in order (last wins):
 
-1. Chart's built-in `values.yaml`
-2. ConfigMap values from the Extension CR's `values.addons.<name>.values` section
-3. Embedded `values/values.yaml` overlay (if using embedded method)
-4. Embedded `values/values.<provider>.yaml` (e.g., `values.aws.yaml`, if using embedded method)
-5. `shootValues` from the manifest
-6. Image overrides from environment variables
-
-## Documentation
-
-- [Registry Credentials & Image Pull Configuration](docs/registry-credentials.md) --
-  Three patterns for runtime image pull auth (node-level containerd, extension-deployed
-  Secrets, Kyverno webhook), manifest configuration reference, credential flow
-  diagram, security model, FAQ.
-- [Build-Time Authentication for Chart Pulling](docs/build-time-auth.md) --
-  OCI registry login, Helm repo env vars, Git token/SSH auth, CI/CD examples
-  for GitHub Actions / GitLab CI / CodeBuild.
+1. Chart's built-in `values.yaml` (from OCI pull or embedded chart)
+2. Base values — `values.<addonName>.yaml` from ConfigMap (or embedded `values/values.yaml`)
+3. Provider-specific values — `values.<addonName>.<provider>.yaml` from ConfigMap (or embedded)
+4. `shootValues` from the addon manifest
+5. Image overrides from environment variables
 
 ## Prerequisites
 
-- Go 1.25+
+- Go 1.24+
 - [ko](https://ko.build/) — container image builder for Go (`go install github.com/google/ko@latest`)
-- [ytt](https://carvel.dev/ytt/) — YAML templating for operator Extension manifests
 - [Helm](https://helm.sh/) 3.x — chart packaging and pushing
 - Gardener v1.80+ with operator Extensions support
 

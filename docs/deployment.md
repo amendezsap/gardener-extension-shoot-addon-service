@@ -14,7 +14,7 @@ How to build, push, and deploy the extension to a Gardener landscape.
 
 ## Prerequisites
 
-- Go 1.25+
+- Go 1.24+
 - [ko](https://ko.build/) for container image builds
 - Helm 3.x for chart packaging
 - Access to a Gardener landscape with the `operator.gardener.cloud/v1alpha1` Extension CRD
@@ -117,24 +117,36 @@ spec:
               enabled: false
         grmNamespaces:
           - managed-resources
-        # Addon configuration -- charts pulled from OCI at runtime
+        # Addon configuration -- charts pulled from OCI at runtime.
+        # addons.manifest is a multi-line string containing the AddonManifest.
+        # addons.values holds per-addon values files keyed by name.
         addons:
-          fluent-bit:
-            enabled: true
-            chart:
-              oci: oci://registry.example.com/charts/fluent-bit
-              version: "0.56.0"
-            namespace: observability
-            target: global
-            values:
-              fullnameOverride: addon-fluent-bit
-            image:
-              valuesKey: image
-            aws:
+          manifest: |
+            apiVersion: addons.gardener.cloud/v1alpha1
+            kind: AddonManifest
+            defaultNamespace: managed-resources
+            globalAWS:
               iamPolicies:
                 - CloudWatchAgentServerPolicy
-              vpcEndpoint:
-                service: logs
+              vpcEndpoints:
+                - service: logs
+            addons:
+              - name: fluent-bit
+                chart:
+                  oci: oci://registry.example.com/charts/fluent-bit
+                  version: "0.56.0"
+                enabled: true
+                target: global
+                managedResourceName: fluent-bit
+                shootValues:
+                  fullnameOverride: fluent-bit
+                image:
+                  valuesKey: image
+          values:
+            values.fluent-bit.yaml: |
+              image:
+                repository: registry.example.com/fluent-bit
+                tag: "4.2.3"
   resources:
     - kind: Extension
       type: shoot-addon-service
@@ -215,10 +227,16 @@ For environments without internet access:
        image:
          repository: air-gapped-registry.example.com/gardener-extension-admission-shoot-addon-service
      addons:
-       fluent-bit:
-         chart:
-           oci: oci://air-gapped-registry.example.com/charts/fluent-bit
-           version: "0.56.0"
+       manifest: |
+         apiVersion: addons.gardener.cloud/v1alpha1
+         kind: AddonManifest
+         defaultNamespace: managed-resources
+         addons:
+           - name: fluent-bit
+             chart:
+               oci: oci://air-gapped-registry.example.com/charts/fluent-bit
+               version: "0.56.0"
+             enabled: true
    ```
 
 ## Upgrading

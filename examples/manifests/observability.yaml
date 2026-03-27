@@ -7,21 +7,20 @@ globalAWS:
   iamPolicies:
     - CloudWatchAgentServerPolicy
     - service-role/AmazonAPIGatewayPushToCloudWatchLogs
+  vpcEndpoints:
+    - service: logs
 
 addons:
   - name: fluent-bit
     chart:
-      oci: oci://ghcr.io/fluent/helm-charts/fluent-bit
+      oci: oci://registry.example.com/charts/fluent-bit
       version: "0.56.0"
     valuesPath: fluent-bit/values
     enabled: true
     shootValues:
-      fullnameOverride: addon-fluent-bit
+      fullnameOverride: fluent-bit
     image:
       valuesKey: image
-    aws:
-      vpcEndpoint:
-        service: logs
 
   - name: container-report
     chart:

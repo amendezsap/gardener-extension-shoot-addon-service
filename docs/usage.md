@@ -24,28 +24,37 @@ The primary way to configure addons is through the Extension CR's `values.addons
 # In the Extension CR applied to the runtime cluster
 values:
   addons:
-    fluent-bit:
-      enabled: true
-      chart:
-        oci: oci://registry.example.com/charts/fluent-bit
-        version: "0.56.0"
-      namespace: observability
-      target: global
-      managedResourceName: fluent-bit
-      values:
-        fullnameOverride: fluent-bit
-        env:
-          - name: REGION
-            value: "{{ .Region }}"
-          - name: SEEDNAME
-            value: "{{ .SeedName }}"
-      image:
-        valuesKey: image
-      aws:
+    manifest: |
+      apiVersion: addons.gardener.cloud/v1alpha1
+      kind: AddonManifest
+      defaultNamespace: managed-resources
+      globalAWS:
         iamPolicies:
           - CloudWatchAgentServerPolicy
-        vpcEndpoint:
-          service: logs
+        vpcEndpoints:
+          - service: logs
+      addons:
+        - name: fluent-bit
+          chart:
+            oci: oci://registry.example.com/charts/fluent-bit
+            version: "0.56.0"
+          enabled: true
+          target: global
+          managedResourceName: fluent-bit
+          shootValues:
+            fullnameOverride: fluent-bit
+          image:
+            valuesKey: image
+    values:
+      values.fluent-bit.yaml: |
+        image:
+          repository: registry.example.com/fluent-bit
+          tag: "4.2.3"
+      values.fluent-bit.aws.yaml: |
+        config:
+          outputs: |
+            [OUTPUT]
+                Name cloudwatch_logs
 ```
 
 The extension reads this ConfigMap on each seed and uses it as the addon manifest. See [examples/extension.yaml](../examples/extension.yaml) for the full Extension CR format.
@@ -94,7 +103,7 @@ addons:
 |---|---|---|
 | `name` | Yes | Unique addon identifier |
 | `chart.path` | Yes* | Path to chart relative to `addons/` (for embedded charts) |
-| `chart.oci` | Yes* | OCI registry reference (e.g., `oci://ghcr.io/org/charts/mychart:1.0`) |
+| `chart.oci` | Yes* | OCI registry reference (e.g., `oci://ghcr.io/org/charts/mychart`) |
 | `chart.repo` | Yes* | Helm repository URL |
 | `chart.git` | Yes* | Git repository URL |
 | `valuesPath` | No | Path to values directory relative to `addons/` |
@@ -183,22 +192,22 @@ Addons with `target: shoot` are still deployed normally on managed seeds -- only
 Values are merged in order (later wins):
 
 1. Chart's built-in `values.yaml`
-2. ConfigMap values from the Extension CR's `values.addons.<name>.values` section
-3. Embedded `addons/<valuesPath>/values.yaml` (if using embedded method)
-4. Embedded `addons/<valuesPath>/values.<provider>.yaml` (e.g., `values.aws.yaml`, if using embedded method)
-5. `shootValues` from the manifest
-6. Image pull secrets from `addon.ImagePullSecrets`
-7. Image overrides from environment variables
+2. Base values -- `values.<addonName>.yaml` from ConfigMap (or embedded `values/values.yaml`)
+3. Provider-specific values -- `values.<addonName>.<provider>.yaml` from ConfigMap (or embedded `values/values.<provider>.yaml`)
+4. `shootValues` from the manifest
+5. Image pull secrets from `addon.ImagePullSecrets`
+6. Image overrides from environment variables
 
 ### Example (runtime config)
 
 For addon `fluent-bit` on an AWS shoot configured via the Extension CR:
 
 ```
-chart values.yaml                     -> chart defaults
-Extension CR values.addons.fluent-bit.values -> runtime config from ConfigMap
-shootValues                           -> fullnameOverride, env vars (REGION, SEEDNAME)
-env ADDON_FLUENT_BIT_IMAGE_REPOSITORY -> image override
+chart values.yaml                        -> chart defaults
+values.fluent-bit.yaml from ConfigMap    -> base config from addons.values
+values.fluent-bit.aws.yaml from ConfigMap -> AWS-specific outputs (CloudWatch)
+shootValues                              -> fullnameOverride, env vars (REGION, SEEDNAME)
+env ADDON_FLUENT_BIT_IMAGE_REPOSITORY    -> image override
 ```
 
 ### Example (embedded)

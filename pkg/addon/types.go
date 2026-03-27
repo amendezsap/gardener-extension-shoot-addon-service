@@ -195,6 +195,38 @@ func (a *Addon) Validate(efs embed.FS) error {
 	return nil
 }
 
+// ValidateRemote checks that the addon definition is well-formed for runtime
+// (non-embedded) operation. It does not check filesystem paths. For OCI
+// chart sources, version is required.
+func (a *Addon) ValidateRemote() error {
+	if a.Name == "" {
+		return fmt.Errorf("addon name is required")
+	}
+
+	sources := 0
+	if a.Chart.Path != "" {
+		sources++
+	}
+	if a.Chart.OCI != "" {
+		sources++
+	}
+	if a.Chart.Repo != "" {
+		sources++
+	}
+	if a.Chart.Git != "" {
+		sources++
+	}
+	if sources == 0 {
+		return fmt.Errorf("addon %q: at least one chart source is required", a.Name)
+	}
+
+	if a.Chart.OCI != "" && a.Chart.Version == "" {
+		return fmt.Errorf("addon %q: version is required for OCI chart source", a.Name)
+	}
+
+	return nil
+}
+
 // ReadManifest reads the manifest.yaml from the embedded FS, unmarshals it,
 // and validates every addon entry.
 func ReadManifest(efs embed.FS) (*AddonManifest, error) {
@@ -218,6 +250,36 @@ func ReadManifest(efs embed.FS) (*AddonManifest, error) {
 	for i := range m.Addons {
 		if err := m.Addons[i].Validate(efs); err != nil {
 			return nil, fmt.Errorf("manifest.yaml: addon[%d]: %w", i, err)
+		}
+	}
+
+	return &m, nil
+}
+
+// ReadManifestFromData parses a manifest from raw YAML string data (e.g.,
+// from a ConfigMap). Unlike ReadManifest, it does not validate chart paths
+// against an embedded FS since charts will be pulled from OCI or other
+// remote sources at runtime.
+func ReadManifestFromData(data string) (*AddonManifest, error) {
+	if data == "" {
+		return nil, fmt.Errorf("manifest data is empty")
+	}
+
+	var m AddonManifest
+	if err := yaml.Unmarshal([]byte(data), &m); err != nil {
+		return nil, fmt.Errorf("parsing manifest: %w", err)
+	}
+
+	if m.APIVersion == "" {
+		return nil, fmt.Errorf("manifest: apiVersion is required")
+	}
+	if m.Kind == "" {
+		return nil, fmt.Errorf("manifest: kind is required")
+	}
+
+	for i := range m.Addons {
+		if err := m.Addons[i].ValidateRemote(); err != nil {
+			return nil, fmt.Errorf("manifest: addon[%d]: %w", i, err)
 		}
 	}
 

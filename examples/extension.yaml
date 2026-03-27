@@ -3,9 +3,16 @@
 # Apply to the RUNTIME cluster:
 #   kubectl apply -f extension.yaml
 #
+# The binary ships bare (no embedded charts). All addon config comes from
+# the values.addons section below, which is propagated as a ConfigMap to
+# each seed. Charts are pulled from OCI registries at runtime.
+#
 # The admission webhook pod deploys to the SEED (in the extension namespace),
 # NOT to the runtime cluster. Both controller and admission are in the same
 # Helm chart deployed via spec.deployment.extension.
+#
+# On managed seeds, the extension skips seed addon deployment -- the parent
+# seed handles it.
 apiVersion: operator.gardener.cloud/v1alpha1
 kind: Extension
 metadata:
@@ -15,19 +22,19 @@ spec:
     extension:
       helm:
         ociRepository:
-          ref: ghcr.io/amendezsap/charts/gardener-extension-shoot-addon-service:0.1.0
+          ref: registry.example.com/your-org/charts/gardener-extension-shoot-addon-service:0.1.0
       # Enable garden API access for the controller pod. This allows the
       # extension to trigger shoot reconciles after fixing stale GRM configs.
       injectGardenKubeconfig: true
       values:
         image:
-          repository: ghcr.io/amendezsap/gardener-extension-shoot-addon-service
+          repository: registry.example.com/your-org/gardener-extension-shoot-addon-service
           tag: "0.1.0"
         admission:
           image:
-            repository: ghcr.io/amendezsap/gardener-extension-admission-shoot-addon-service
+            repository: registry.example.com/your-org/gardener-extension-admission-shoot-addon-service
             tag: "0.1.0"
-        # Controller defaults — applied when a shoot has no providerConfig.
+        # Controller defaults -- applied when a shoot has no providerConfig.
         defaults:
           aws:
             vpcEndpoint:
@@ -42,6 +49,42 @@ spec:
           limits:
             cpu: 200m
             memory: 256Mi
+        # Addon configuration -- propagated as a ConfigMap to each seed.
+        # Charts are pulled from OCI registries at runtime.
+        # Fallback chain: ConfigMap -> embedded charts -> nothing.
+        addons:
+          fluent-bit:
+            enabled: true
+            chart:
+              oci: oci://registry.example.com/charts/fluent-bit
+              version: "0.56.0"
+            namespace: observability
+            target: global
+            managedResourceName: fluent-bit
+            values:
+              fullnameOverride: addon-fluent-bit
+              env:
+                - name: REGION
+                  value: "{{ .Region }}"
+                - name: SEEDNAME
+                  value: "{{ .SeedName }}"
+            image:
+              valuesKey: image
+            aws:
+              iamPolicies:
+                - CloudWatchAgentServerPolicy
+              vpcEndpoint:
+                service: logs
+          # Example: a second addon
+          # container-report:
+          #   enabled: true
+          #   chart:
+          #     oci: oci://registry.example.com/charts/container-report
+          #     version: "1.0.0"
+          #   namespace: observability
+          #   target: seed
+          #   values:
+          #     schedule: "0 */6 * * *"
   resources:
     - kind: Extension
       type: shoot-addon-service

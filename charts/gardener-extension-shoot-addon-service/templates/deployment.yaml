@@ -50,6 +50,8 @@ spec:
               value: {{ $override.tag | quote }}
             {{- end }}
             {{- end }}
+            - name: OCI_CHART_CACHE_DIR
+              value: {{ .Values.ociChartCacheDir | quote }}
           ports:
             - name: metrics
               containerPort: 8080
@@ -71,3 +73,9 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: chart-cache
+              mountPath: {{ .Values.ociChartCacheDir }}
+      volumes:
+        - name: chart-cache
+          emptyDir: {}

@@ -1,5 +1,0 @@
-image:
-  repository: ghcr.io/amendezsap/list-containers
-  tag: "v1.0.0"
-
-schedule: "*/30 * * * *"

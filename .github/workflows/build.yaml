@@ -18,6 +18,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache: true
 
       - name: Build
         run: make build build-admission
@@ -52,10 +53,20 @@ jobs:
           go-version-file: go.mod
 
       - name: Validate addon manifest
-        run: make validate
+        run: |
+          if [ -f charts/embedded/addons/manifest.yaml ]; then
+            make validate
+          else
+            echo "No embedded addon manifest — skipping (runtime config mode)"
+          fi
 
       - name: Verify embedded addons
-        run: make verify-prepare
+        run: |
+          if [ -f charts/embedded/addons/manifest.yaml ]; then
+            make verify-prepare
+          else
+            echo "No embedded addons — skipping (runtime config mode)"
+          fi
 
   reuse:
     runs-on: ubuntu-latest

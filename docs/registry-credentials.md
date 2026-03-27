@@ -223,7 +223,7 @@ kubectl get secret my-registry \
 # Expected: kubernetes.io/dockerconfigjson
 
 # Check that the DaemonSet references it
-kubectl get daemonset addon-fluent-bit \
+kubectl get daemonset fluent-bit \
   --namespace=managed-resources \
   -o jsonpath='{.spec.template.spec.imagePullSecrets}'
 # Expected: [{"name":"my-registry"}]
@@ -380,6 +380,15 @@ registrySecrets:
       name: my-registry-creds
       namespace: extension-shoot-addon-service
 
+# --- Global AWS ---
+# IAM policies and VPC endpoints applied at the shoot level, not per-addon.
+globalAWS:
+  iamPolicies:
+    - CloudWatchAgentServerPolicy
+    - service-role/AmazonAPIGatewayPushToCloudWatchLogs
+  vpcEndpoints:
+    - service: logs
+
 # --- Addons ---
 addons:
   - name: fluent-bit
@@ -388,17 +397,11 @@ addons:
     valuesPath: fluent-bit/values
     enabled: true
     shootValues:
-      fullnameOverride: addon-fluent-bit
+      fullnameOverride: fluent-bit
     image:
       valuesKey: image
     imagePullSecrets:
       - my-registry
-    aws:
-      iamPolicies:
-        - CloudWatchAgentServerPolicy
-        - service-role/AmazonAPIGatewayPushToCloudWatchLogs
-      vpcEndpoint:
-        service: logs
 
   - name: container-report
     chart:
@@ -478,7 +481,7 @@ RECONCILIATION TIME (per shoot)
         |
         +-- Builds ManagedResource bundle:
         |     - Secret "my-registry" (type: dockerconfigjson)
-        |     - DaemonSet "addon-fluent-bit" (imagePullSecrets: my-registry)
+        |     - DaemonSet "fluent-bit" (imagePullSecrets: my-registry)
         |     - CronJob "container-report" (imagePullSecrets: my-registry)
         |     - ServiceAccount, ClusterRole, ClusterRoleBinding, ...
         |
@@ -658,7 +661,7 @@ Check these in order:
 
 4. **Pod spec references the Secret**:
    ```bash
-   kubectl get daemonset addon-fluent-bit -n managed-resources \
+   kubectl get daemonset fluent-bit -n managed-resources \
      -o jsonpath='{.spec.template.spec.imagePullSecrets}'
    ```
 

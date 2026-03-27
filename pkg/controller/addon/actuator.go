@@ -280,7 +280,15 @@ metadata:
 		ns := addon.GetNamespace(manifest.DefaultNamespace)
 		mrName := addon.GetManagedResourceName()
 
-		secretData, err := a.renderAddonChart(addon, meta, manifest, configMapValues)
+		// Look up per-shoot override for this addon
+		var addonOverride *config.AddonOverride
+		if cfg.Addons != nil {
+			if override, ok := cfg.Addons[addon.Name]; ok {
+				addonOverride = &override
+			}
+		}
+
+		secretData, err := a.renderAddonChart(addon, meta, manifest, configMapValues, addonOverride)
 		if err != nil {
 			return fmt.Errorf("failed to render chart for addon %s: %w", addon.Name, err)
 		}
@@ -623,6 +631,19 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 	if a.isManagedSeed(ctx, log, seedName) {
 		log.Info("Skipping seed addon deployment — managed seed, parent extension deploys via shoot MR",
 			"seedName", seedName)
+		// Clean up any stale seed MRs from before managed seed detection was added.
+		if err := managedresources.DeleteForSeed(ctx, a.client, namespace, "seed-addon-namespace"); err == nil {
+			log.Info("Cleaned up stale seed ManagedResource", "managedResource", "seed-addon-namespace")
+		}
+		for i := range manifest.Addons {
+			addon := &manifest.Addons[i]
+			if addon.DeploysToSeed() {
+				mrName := "seed-" + addon.GetManagedResourceName()
+				if err := managedresources.DeleteForSeed(ctx, a.client, namespace, mrName); err == nil {
+					log.Info("Cleaned up stale seed ManagedResource", "managedResource", mrName)
+				}
+			}
+		}
 		return
 	}
 
@@ -673,7 +694,7 @@ metadata:
 
 		mrName := "seed-" + addon.GetManagedResourceName()
 
-		secretData, err := a.renderAddonChart(addon, meta, manifest, configMapValues)
+		secretData, err := a.renderAddonChart(addon, meta, manifest, configMapValues, nil)
 		if err != nil {
 			log.Error(err, "Failed to render seed addon chart", "addon", addon.Name)
 			continue
@@ -1187,7 +1208,7 @@ data:
 //
 //	{{ .Region }}   -> meta.Region
 //	{{ .SeedName }} -> meta.SeedName
-func (a *actuator) renderAddonChart(addon *addonpkg.Addon, meta *shootMetadata, manifest *addonpkg.AddonManifest, configMapValues map[string]string) (map[string][]byte, error) {
+func (a *actuator) renderAddonChart(addon *addonpkg.Addon, meta *shootMetadata, manifest *addonpkg.AddonManifest, configMapValues map[string]string, perShootOverride *config.AddonOverride) (map[string][]byte, error) {
 	merged := map[string]interface{}{}
 
 	if configMapValues != nil {
@@ -1254,6 +1275,21 @@ func (a *actuator) renderAddonChart(addon *addonpkg.Addon, meta *shootMetadata, 
 	// Image overrides from environment variables
 	if addon.Image != nil {
 		applyImageOverride(merged, addon)
+	}
+
+	// Per-shoot values override (highest priority — for debugging/testing)
+	if perShootOverride != nil && perShootOverride.ValuesOverride != "" {
+		overrideVals, err := parseYAMLValues(perShootOverride.ValuesOverride)
+		if err != nil {
+			return nil, fmt.Errorf("parse per-shoot values override for %s: %w", addon.Name, err)
+		}
+		if perShootOverride.IsOverrideMode() {
+			// Full replace — discard all previous values
+			merged = overrideVals
+		} else {
+			// Merge (default) — additive, only specified keys change
+			merged = mergeMaps(merged, overrideVals)
+		}
 	}
 
 	// Create a chart renderer

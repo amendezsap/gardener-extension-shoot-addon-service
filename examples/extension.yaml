@@ -52,39 +52,51 @@ spec:
         # Addon configuration -- propagated as a ConfigMap to each seed.
         # Charts are pulled from OCI registries at runtime.
         # Fallback chain: ConfigMap -> embedded charts -> nothing.
+        # addons.manifest is a multi-line string containing the AddonManifest.
+        # addons.values holds per-addon values files keyed by name.
         addons:
-          fluent-bit:
-            enabled: true
-            chart:
-              oci: oci://registry.example.com/charts/fluent-bit
-              version: "0.56.0"
-            namespace: observability
-            target: global
-            managedResourceName: fluent-bit
-            values:
-              fullnameOverride: addon-fluent-bit
-              env:
-                - name: REGION
-                  value: "{{ .Region }}"
-                - name: SEEDNAME
-                  value: "{{ .SeedName }}"
-            image:
-              valuesKey: image
-            aws:
+          manifest: |
+            apiVersion: addons.gardener.cloud/v1alpha1
+            kind: AddonManifest
+            defaultNamespace: managed-resources
+            globalAWS:
               iamPolicies:
                 - CloudWatchAgentServerPolicy
-              vpcEndpoint:
-                service: logs
-          # Example: a second addon
-          # container-report:
-          #   enabled: true
-          #   chart:
-          #     oci: oci://registry.example.com/charts/container-report
-          #     version: "1.0.0"
-          #   namespace: observability
-          #   target: seed
-          #   values:
-          #     schedule: "0 */6 * * *"
+              vpcEndpoints:
+                - service: logs
+            addons:
+              - name: fluent-bit
+                chart:
+                  oci: oci://registry.example.com/charts/fluent-bit
+                  version: "0.56.0"
+                enabled: true
+                target: global
+                managedResourceName: fluent-bit
+                shootValues:
+                  fullnameOverride: fluent-bit
+                image:
+                  valuesKey: image
+              # Example: a second addon
+              # - name: container-report
+              #   chart:
+              #     oci: oci://registry.example.com/charts/container-report
+              #     version: "1.0.0"
+              #   enabled: true
+              #   target: seed
+          values:
+            values.fluent-bit.yaml: |
+              image:
+                repository: registry.example.com/fluent-bit
+                tag: "4.2.3"
+            values.fluent-bit.aws.yaml: |
+              config:
+                outputs: |
+                  [OUTPUT]
+                      Name cloudwatch_logs
+                      Match *
+                      region {{ .Region }}
+                      log_group_name /k8s/{{ .SeedName }}
+                      log_stream_prefix fluent-bit-
   resources:
     - kind: Extension
       type: shoot-addon-service

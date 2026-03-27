@@ -18,9 +18,24 @@ type AddonServiceConfig struct {
 	AWS    *AWSOverride             `json:"aws,omitempty"`
 }
 
-// AddonOverride allows enabling/disabling individual addons.
+// AddonOverride allows enabling/disabling individual addons and overriding
+// their values on a per-shoot basis.
 type AddonOverride struct {
 	Enabled *bool `json:"enabled,omitempty"`
+	// ValuesOverride is a YAML string of values to merge into (or replace)
+	// the addon's values for this shoot only. Useful for debugging or
+	// per-shoot customization.
+	ValuesOverride string `json:"valuesOverride,omitempty"`
+	// ValuesMode controls how ValuesOverride is applied:
+	//   "merge" (default) — deep-merge with existing values, only specified keys change
+	//   "override" — replace all values entirely with ValuesOverride
+	ValuesMode string `json:"valuesMode,omitempty"`
+}
+
+// IsOverrideMode returns true if ValuesMode is "override" (full replace).
+// Default is merge (additive).
+func (o *AddonOverride) IsOverrideMode() bool {
+	return strings.EqualFold(o.ValuesMode, "override")
 }
 
 // AWSOverride holds AWS-specific configuration overrides.

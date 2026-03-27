@@ -14,7 +14,7 @@ How to set up a local development environment, build, test, and contribute.
 
 ## Prerequisites
 
-- Go 1.25+
+- Go 1.24+
 - [ko](https://ko.build/) — `go install github.com/google/ko@latest`
 - Helm 3.x
 - Access to a Gardener landscape (for integration testing)
@@ -112,15 +112,23 @@ Add the addon to the Extension CR's `values.addons` section. No code changes or 
 # In the Extension CR applied to the runtime cluster
 values:
   addons:
-    my-addon:
-      enabled: true
-      chart:
-        oci: oci://registry.example.com/charts/my-addon
-        version: "1.0.0"
-      namespace: my-namespace
-      target: shoot          # or seed, or global
-      managedResourceName: my-addon
-      values:
+    manifest: |
+      apiVersion: addons.gardener.cloud/v1alpha1
+      kind: AddonManifest
+      defaultNamespace: managed-resources
+      addons:
+        - name: my-addon
+          chart:
+            oci: oci://registry.example.com/charts/my-addon
+            version: "1.0.0"
+          enabled: true
+          target: shoot          # or seed, or global
+          managedResourceName: my-addon
+          shootValues:
+            fullnameOverride: my-addon
+    values:
+      values.my-addon.yaml: |
+        # Base values for my-addon
         fullnameOverride: my-addon
 ```
 

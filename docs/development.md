@@ -37,7 +37,7 @@ How to set up a local development environment, build, test, and contribute.
 │   ├── gardener-extension-shoot-addon-service/     # Extension Helm chart
 │   ├── gardener-extension-admission-shoot-addon-service/  # Admission charts (virtual garden RBAC)
 │   └── embedded/
-│       └── addons/        # Embedded addon charts + manifest (go:embed)
+│       └── addons/        # Empty by default — only populated for self-contained builds (go:embed)
 ├── examples/              # Example addon definitions and manifests
 │   └── addons/
 │       ├── fluent-bit/
@@ -102,15 +102,41 @@ make verify-prepare
 
 ## Adding an Addon
 
-### Step 1: Create the addon directory
+There are two methods for adding addons. Runtime config via the Extension CR is recommended.
+
+### Method 1: Runtime Config (Recommended)
+
+Add the addon to the Extension CR's `values.addons` section. No code changes or rebuilds needed.
+
+```yaml
+# In the Extension CR applied to the runtime cluster
+values:
+  addons:
+    my-addon:
+      enabled: true
+      chart:
+        oci: oci://registry.example.com/charts/my-addon
+        version: "1.0.0"
+      namespace: my-namespace
+      target: shoot          # or seed, or global
+      managedResourceName: my-addon
+      values:
+        fullnameOverride: my-addon
+```
+
+Apply the updated Extension CR and the operator propagates the config as a ConfigMap to each seed. The extension pulls the chart from OCI at runtime.
+
+### Method 2: Embedded (Self-Contained Fallback)
+
+For self-contained builds where charts are compiled into the binary.
+
+#### Step 1: Create the addon directory
 
 ```bash
 mkdir -p addons/my-addon/chart addons/my-addon/values
 ```
 
-### Step 2: Add the Helm chart
-
-Either copy a chart directly or use the prepare tool:
+#### Step 2: Add the Helm chart
 
 ```bash
 # Pull from OCI registry
@@ -120,13 +146,13 @@ make pull-chart ARGS="--oci oci://registry.example.com/charts/my-chart --version
 cp -r /path/to/my-chart/* addons/my-addon/chart/
 ```
 
-### Step 3: Add values
+#### Step 3: Add values
 
 Create `addons/my-addon/values/values.yaml` with base values, and optionally `values.aws.yaml` for provider-specific overrides.
 
-### Step 4: Declare in manifest
+#### Step 4: Declare in manifest
 
-Add the addon to `addons/manifest.yaml`:
+Add the addon to `charts/embedded/addons/manifest.yaml`:
 
 ```yaml
 addons:
@@ -141,7 +167,7 @@ addons:
       fullnameOverride: my-addon
 ```
 
-### Step 5: Prepare and build
+#### Step 5: Prepare and build
 
 ```bash
 make prepare    # Copies addons to charts/embedded/addons/

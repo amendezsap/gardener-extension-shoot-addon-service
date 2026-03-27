@@ -1,12 +1,14 @@
 # Usage Guide
 
-This guide covers creating addon manifests, configuring chart sources, and deploying addons to shoots and seeds.
+This guide covers configuring addons, chart sources, deployment targets, and values layering.
 
 ## Table of Contents
 
-- [Addon Manifest](#addon-manifest)
+- [Runtime Configuration (Recommended)](#runtime-configuration-recommended)
+- [Addon Manifest (Embedded Fallback)](#addon-manifest-embedded-fallback)
 - [Chart Sources](#chart-sources)
 - [Deployment Targets](#deployment-targets)
+- [Managed Seed Behavior](#managed-seed-behavior)
 - [Values Layering](#values-layering)
 - [Template Variables](#template-variables)
 - [Per-Shoot Configuration](#per-shoot-configuration)
@@ -14,18 +16,58 @@ This guide covers creating addon manifests, configuring chart sources, and deplo
 - [Image Overrides](#image-overrides)
 - [GRM Namespace Provisioning](#grm-namespace-provisioning)
 
-## Addon Manifest
+## Runtime Configuration (Recommended)
 
-The addon manifest (`addons/manifest.yaml`) declares which Helm charts the extension deploys. It is compiled into the binary at build time via `go:embed`.
+The primary way to configure addons is through the Extension CR's `values.addons` section. The operator propagates this configuration as a ConfigMap to each seed. Charts are pulled from OCI registries at runtime -- no custom builds needed.
+
+```yaml
+# In the Extension CR applied to the runtime cluster
+values:
+  addons:
+    fluent-bit:
+      enabled: true
+      chart:
+        oci: oci://registry.example.com/charts/fluent-bit
+        version: "0.56.0"
+      namespace: observability
+      target: global
+      managedResourceName: fluent-bit
+      values:
+        fullnameOverride: fluent-bit
+        env:
+          - name: REGION
+            value: "{{ .Region }}"
+          - name: SEEDNAME
+            value: "{{ .SeedName }}"
+      image:
+        valuesKey: image
+      aws:
+        iamPolicies:
+          - CloudWatchAgentServerPolicy
+        vpcEndpoint:
+          service: logs
+```
+
+The extension reads this ConfigMap on each seed and uses it as the addon manifest. See [examples/extension.yaml](../examples/extension.yaml) for the full Extension CR format.
+
+### Fallback Chain
+
+The extension resolves addon configuration in this order:
+
+1. **ConfigMap** (from Extension CR `values.addons`) -- primary, recommended
+2. **Embedded charts** (from `charts/embedded/addons/`) -- fallback for self-contained builds
+3. **Nothing** -- no addons deployed if neither source provides config
+
+## Addon Manifest (Embedded Fallback)
+
+For self-contained builds, addons can be declared in `charts/embedded/addons/manifest.yaml` and compiled into the binary via `go:embed`. This is the fallback method -- use it when you need a binary with zero runtime registry dependencies.
 
 ```yaml
 apiVersion: addons.gardener.cloud/v1alpha1
 kind: AddonManifest
 
-# Namespace where addon resources are deployed in each shoot/seed.
 defaultNamespace: managed-resources
 
-# AWS infrastructure applied to every shoot (optional).
 globalAWS:
   iamPolicies:
     - CloudWatchAgentServerPolicy
@@ -42,11 +84,6 @@ addons:
     managedResourceName: fluent-bit
     shootValues:
       fullnameOverride: fluent-bit
-      env:
-        - name: REGION
-          value: "{{ .Region }}"
-        - name: SEEDNAME
-          value: "{{ .SeedName }}"
     image:
       valuesKey: image
 ```
@@ -73,30 +110,30 @@ addons:
 
 ## Chart Sources
 
-### Local (embedded)
+### OCI Registry (primary)
 
-Charts stored in `addons/<path>/` are compiled into the binary via `go:embed`.
+The recommended approach. Charts are pulled from OCI registries at runtime on the seed. Specify the chart reference in the Extension CR's `values.addons` section or in the embedded manifest.
+
+```yaml
+chart:
+  oci: oci://registry.example.com/charts/fluent-bit
+  version: "0.56.0"
+```
+
+### Local (embedded fallback)
+
+Charts stored in `charts/embedded/addons/<path>/` are compiled into the binary via `go:embed`. Use `make prepare` to pull charts from remote sources into the local directory before building.
 
 ```yaml
 chart:
   path: fluent-bit/chart
 ```
 
-Use `make prepare` to pull charts from remote sources into the local directory before building.
-
-### OCI Registry
-
-```yaml
-chart:
-  oci: oci://ghcr.io/fluent/helm-charts/fluent-bit
-  version: "0.48.0"
-```
-
 ### Helm Repository
 
 ```yaml
 chart:
-  repo: https://fluent.github.io/helm-charts
+  repo: https://charts.example.com/helm-charts
   repoChart: fluent-bit
   version: "0.48.0"
 ```
@@ -105,7 +142,7 @@ chart:
 
 ```yaml
 chart:
-  git: https://github.com/fluent/helm-charts
+  git: https://github.com/example/helm-charts
   gitPath: charts/fluent-bit
   gitRef: main
 ```
@@ -135,25 +172,45 @@ Addons with `target: global` are deployed to both. The same chart and values are
 - **Shoot context:** `{{ .SeedName }}` = the seed managing the shoot
 - **Seed context:** `{{ .SeedName }}` = the seed's own name (from `SEED_NAME` env var)
 
+## Managed Seed Behavior
+
+On managed seeds, the extension skips seed-targeted addon deployment. The parent seed is responsible for deploying seed-level addons to managed seeds. This prevents duplicate deployments.
+
+Addons with `target: shoot` are still deployed normally on managed seeds -- only `target: seed` and the seed portion of `target: global` are skipped.
+
 ## Values Layering
 
 Values are merged in order (later wins):
 
-1. `addons/<valuesPath>/values.yaml` — base values
-2. `addons/<valuesPath>/values.<provider>.yaml` — provider-specific (e.g., `values.aws.yaml`)
-3. `addon.ShootValues` from `manifest.yaml` — per-addon shoot values
-4. Image pull secrets from `addon.ImagePullSecrets`
-5. Image overrides from environment variables
+1. Chart's built-in `values.yaml`
+2. ConfigMap values from the Extension CR's `values.addons.<name>.values` section
+3. Embedded `addons/<valuesPath>/values.yaml` (if using embedded method)
+4. Embedded `addons/<valuesPath>/values.<provider>.yaml` (e.g., `values.aws.yaml`, if using embedded method)
+5. `shootValues` from the manifest
+6. Image pull secrets from `addon.ImagePullSecrets`
+7. Image overrides from environment variables
 
-### Example
+### Example (runtime config)
 
-For addon `fluent-bit` on an AWS shoot:
+For addon `fluent-bit` on an AWS shoot configured via the Extension CR:
 
 ```
-values.yaml           → base config (service, parsers, general)
-values.aws.yaml       → AWS-specific outputs (CloudWatch)
-manifest.shootValues  → fullnameOverride, env vars (REGION, SEEDNAME)
-env ADDON_FLUENT_BIT_IMAGE_REPOSITORY → image override
+chart values.yaml                     -> chart defaults
+Extension CR values.addons.fluent-bit.values -> runtime config from ConfigMap
+shootValues                           -> fullnameOverride, env vars (REGION, SEEDNAME)
+env ADDON_FLUENT_BIT_IMAGE_REPOSITORY -> image override
+```
+
+### Example (embedded)
+
+For addon `fluent-bit` on an AWS shoot using embedded charts:
+
+```
+chart values.yaml           -> chart defaults
+values.yaml                 -> base config (service, parsers, general)
+values.aws.yaml             -> AWS-specific outputs (CloudWatch)
+manifest.shootValues        -> fullnameOverride, env vars (REGION, SEEDNAME)
+env ADDON_FLUENT_BIT_IMAGE_REPOSITORY -> image override
 ```
 
 ## Template Variables

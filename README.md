@@ -14,18 +14,29 @@ A [Gardener](https://gardener.cloud) extension that deploys user-defined Helm ch
 
 ## How It Works
 
-1. **You add charts** — clone this repo, pull Helm charts into `charts/embedded/addons/`, and declare them in `manifest.yaml`
-2. **You build** — `go:embed` compiles your charts into the binary. No runtime registry dependencies.
-3. **You deploy** — the extension runs on each seed and deploys your addons to every shoot as Gardener ManagedResources
+The binary ships bare -- `charts/embedded/addons/` is empty by default. Addon configuration is provided at deploy time through the operator Extension CR.
+
+1. **You configure addons** in the Extension CR's `values.addons` section -- OCI chart references, versions, and values
+2. **You deploy** the Extension CR to the runtime cluster. The operator creates a ConfigMap on each seed with your addon config.
+3. **The extension pulls charts** from OCI registries at runtime and deploys them to every shoot as Gardener ManagedResources
 
 ```
 ┌──────────────┐     ┌──────────────┐     ┌───────────────┐
-│ Your charts  │────▶│  go:embed    │────▶│  Extension     │
-│ + values     │     │  at build    │     │  renders &     │
-│ + manifest   │     │  time        │     │  deploys to    │
+│ Extension CR │────▶│  ConfigMap   │────▶│  Extension     │
+│ values.addons│     │  on each     │     │  pulls charts  │
+│ (OCI refs +  │     │  seed        │     │  from OCI &    │
+│  values)     │     │              │     │  deploys to    │
 │              │     │              │     │  every shoot   │
 └──────────────┘     └──────────────┘     └───────────────┘
 ```
+
+### Two Deployment Methods
+
+**Runtime config (recommended):** Addon definitions live in the Extension CR. Charts are pulled from OCI registries at runtime. The same binary works everywhere -- no custom builds per environment.
+
+**Embedded (self-contained fallback):** Pull charts into `charts/embedded/addons/`, declare them in `manifest.yaml`, and build with `go:embed`. Useful when you need a fully self-contained binary with zero runtime registry dependencies.
+
+The extension uses a fallback chain: ConfigMap (runtime) -> embedded charts -> nothing.
 
 ## Architecture
 
@@ -48,7 +59,7 @@ Seed Cluster
 │       └── Enables ManagedResources to deploy to custom namespaces
 ```
 
-**Controller pod** (`cmd/gardener-extension-shoot-addon-service/`): The main reconciliation loop. Watches Extension resources, renders Helm charts from embedded addons, creates ManagedResources, and manages AWS infrastructure. Participates in leader election like all Gardener extension controllers.
+**Controller pod** (`cmd/gardener-extension-shoot-addon-service/`): The main reconciliation loop. Watches Extension resources, loads addon config from the seed ConfigMap (falling back to embedded charts), pulls charts from OCI registries, renders them, creates ManagedResources, and manages AWS infrastructure. Participates in leader election like all Gardener extension controllers. On managed seeds, the extension skips seed-targeted addon deployment (the parent seed handles it).
 
 **Admission pod** (`cmd/gardener-extension-admission-shoot-addon-service/`): A dedicated webhook server that intercepts GRM ConfigMap creation and removes the namespace restriction. Runs independently of the controller pod with no leader election dependency, so it is always ready to intercept ConfigMap creates even during controller rollouts or restarts.
 
@@ -57,122 +68,87 @@ Seed Cluster
 ## Features
 
 - **Any Helm chart** — Fluent Bit, Prometheus, nginx, your internal tools — anything that's a Helm chart
-- **Multiple chart sources** — OCI registries, Helm repos, Git repos, local paths
-- **Air-gap friendly** — everything embeds at build time, zero runtime network dependencies
+- **Runtime configuration** — addon config via Extension CR values, no custom builds needed per environment
+- **OCI chart pull at runtime** — charts pulled from OCI registries on the seed, not baked into the binary
+- **Embedded fallback** — optionally embed charts at build time for fully self-contained, air-gapped binaries
+- **Managed seed aware** — skips seed addon deployment on managed seeds (parent seed handles it)
 - **AWS infrastructure** — optional IAM policy attachment and VPC endpoint management per addon
-- **Per-shoot overrides** — shoots can enable/disable addons or toggle features via `providerConfig`
+- **Per-shoot overrides** — shoots can enable/disable addons or toggle features via `providerConfig` (planned)
 - **GRM namespace provisioner** — in-process webhook ensures ManagedResources can deploy to any namespace
 
 ## Quick Start
 
 ```bash
-# 1. Clone
+# 1. Clone and build (binary ships bare -- no charts embedded)
 git clone https://github.com/amendezsap/gardener-extension-shoot-addon-service
 cd gardener-extension-shoot-addon-service
+make release REGISTRY=registry.example.com/your-org
 
-# 2. Pull a chart
-make pull-chart NAME=fluent-bit \
-  OCI=oci://ghcr.io/fluent/helm-charts/fluent-bit \
-  VERSION=0.56.0
-
-# 3. Add your values
-cp examples/addons/fluent-bit/values/* charts/embedded/addons/fluent-bit/values/
-
-# 4. Declare it in the manifest
-cp examples/manifests/minimal.yaml charts/embedded/addons/manifest.yaml
-
-# 5. Build and push
-make release REGISTRY=ghcr.io/your-org
-
-# 6. Deploy to Gardener
-ytt -f examples/ytt/ \
-  -v registry=ghcr.io/your-org \
-  -v version=$(cat VERSION) \
-  | kubectl apply -f -
+# 2. Deploy the Extension CR with your addon config
+kubectl apply -f examples/extension.yaml   # edit values.addons first
 ```
+
+The Extension CR's `values.addons` section defines which charts to pull from OCI registries and what values to apply. See [examples/extension.yaml](examples/extension.yaml) for the full format.
 
 ## Chart Sources
 
-The Makefile supports pulling charts from any source:
-
-```bash
-# OCI registry (ghcr.io, Harbor, ECR, etc.)
-make pull-chart NAME=fluent-bit \
-  OCI=oci://ghcr.io/fluent/helm-charts/fluent-bit \
-  VERSION=0.56.0
-
-# Helm repository
-make pull-chart NAME=fluent-bit \
-  REPO=https://fluent.github.io/helm-charts \
-  CHART=fluent-bit \
-  VERSION=0.48.6
-
-# Git repository (GitHub, GitLab, any git host)
-make pull-chart NAME=fluent-bit \
-  GIT=https://github.com/fluent/helm-charts \
-  GIT_PATH=charts/fluent-bit \
-  GIT_REF=main
-
-# Local path
-make pull-chart NAME=my-app PATH=/path/to/my/chart
-```
-
-## Addon Manifest
-
-The manifest (`charts/embedded/addons/manifest.yaml`) declares what the extension deploys:
+**Runtime (primary):** Specify OCI chart references in the Extension CR's `values.addons` section. Charts are pulled on the seed at runtime.
 
 ```yaml
-apiVersion: addons.gardener.cloud/v1alpha1
-kind: AddonManifest
-
-# Default namespace for all addons on shoots
-defaultNamespace: observability
-
-addons:
-  - name: fluent-bit
-    chart:
-      path: fluent-bit/chart         # relative to addons/ dir
-    valuesPath: fluent-bit/values     # values overlay directory
-    enabled: true
-
-    # Values injected from shoot metadata at render time
-    shootValues:
-      fullnameOverride: addon-fluent-bit
-
-    # Image override — configurable via Helm values without rebuild
-    image:
-      valuesKey: image
-
-    # AWS infrastructure provisioned alongside this addon (optional)
-    aws:
-      iamPolicies:
-        - CloudWatchAgentServerPolicy
-      vpcEndpoint:
-        service: logs
+values:
+  addons:
+    fluent-bit:
+      chart:
+        oci: oci://registry.example.com/charts/fluent-bit
+        version: "0.56.0"
 ```
 
-See `examples/manifests/` for more patterns:
-- `minimal.yaml` — single addon, local chart
-- `observability.yaml` — Fluent Bit + container report with AWS infra
-- `full.yaml` — multiple addons from different sources (OCI, git, Helm repo)
+**Embedded (fallback):** For self-contained builds, pull charts into `charts/embedded/addons/` before building:
+
+```bash
+make pull-chart NAME=fluent-bit \
+  OCI=oci://registry.example.com/charts/fluent-bit \
+  VERSION=0.56.0
+```
+
+## Addon Configuration
+
+Addons are configured in the Extension CR's `values.addons` section. The operator propagates this as a ConfigMap to each seed.
+
+```yaml
+values:
+  addons:
+    fluent-bit:
+      enabled: true
+      chart:
+        oci: oci://registry.example.com/charts/fluent-bit
+        version: "0.56.0"
+      namespace: observability
+      values:
+        fullnameOverride: addon-fluent-bit
+      aws:
+        iamPolicies:
+          - CloudWatchAgentServerPolicy
+        vpcEndpoint:
+          service: logs
+```
+
+For self-contained builds, addons can also be declared in `charts/embedded/addons/manifest.yaml` (see the embedded fallback method in [docs/usage.md](docs/usage.md)).
 
 ## Directory Structure
 
 ```
-charts/embedded/addons/           # YOUR CONTENT — add charts here
-├── manifest.yaml                 # declares what to deploy
+charts/embedded/addons/           # Empty by default — used only for embedded builds
+├── manifest.yaml                 # declares what to deploy (embedded method only)
 ├── fluent-bit/                   # one directory per addon
 │   ├── chart/                    # the Helm chart (pulled via make pull-chart)
-│   │   ├── Chart.yaml
-│   │   ├── templates/
-│   │   └── values.yaml
 │   └── values/                   # your values overlays
-│       ├── values.yaml           # base values
-│       └── values.aws.yaml       # provider-specific (optional)
 └── another-addon/
     ├── chart/
     └── values/
 ```
+
+For runtime config (recommended), addon definitions live in the Extension CR -- this directory stays empty.
 
 ## Per-Shoot Configuration
 
@@ -234,10 +210,11 @@ IAM policies removed from `globalAWS.iamPolicies` are automatically detached on 
 For each addon, values are merged in order (last wins):
 
 1. Chart's built-in `values.yaml`
-2. Your `values/values.yaml` overlay
-3. Your `values/values.<provider>.yaml` (e.g., `values.aws.yaml`)
-4. `shootValues` from the manifest
-5. Image overrides from Helm values (env vars)
+2. ConfigMap values from the Extension CR's `values.addons.<name>.values` section
+3. Embedded `values/values.yaml` overlay (if using embedded method)
+4. Embedded `values/values.<provider>.yaml` (e.g., `values.aws.yaml`, if using embedded method)
+5. `shootValues` from the manifest
+6. Image overrides from environment variables
 
 ## Documentation
 

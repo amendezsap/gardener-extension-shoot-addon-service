@@ -31,24 +31,44 @@ import (
 	"github.com/gardener/gardener/pkg/chartrenderer"
 	"github.com/gardener/gardener/pkg/utils/managedresources"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
 	addonpkg "github.com/amendezsap/gardener-extension-shoot-addon-service/pkg/addon"
+	"github.com/amendezsap/gardener-extension-shoot-addon-service/pkg/addon/oci"
 	"github.com/amendezsap/gardener-extension-shoot-addon-service/pkg/apis/config"
 	awsutil "github.com/amendezsap/gardener-extension-shoot-addon-service/pkg/aws"
 	"github.com/amendezsap/gardener-extension-shoot-addon-service/charts/embedded"
 )
 
+// ConfigMapName is the name of the ConfigMap that holds runtime addon configuration.
+const ConfigMapName = "shoot-addon-service-config"
+
 // actuator implements the extension.Actuator interface.
 type actuator struct {
-	client          client.Client
-	restConfig      *rest.Config
-	seedAddonsOnce  sync.Once
+	client         client.Client
+	restConfig     *rest.Config
+	chartPuller    *oci.ChartPuller
+	seedAddonsHash string
+	mu             sync.Mutex
 }
 
 // NewActuator creates a new actuator.
 func NewActuator(mgr manager.Manager) *actuator {
+	cacheDir := os.Getenv("OCI_CHART_CACHE_DIR")
+	if cacheDir == "" {
+		cacheDir = "/tmp/addon-charts"
+	}
+
+	log := mgr.GetLogger().WithName("addon-actuator")
+	puller, err := oci.NewChartPuller(cacheDir, log)
+	if err != nil {
+		log.Error(err, "Failed to create OCI chart puller — OCI charts will not be available")
+	}
+
 	return &actuator{
-		client:     mgr.GetClient(),
-		restConfig: mgr.GetConfig(),
+		client:      mgr.GetClient(),
+		restConfig:  mgr.GetConfig(),
+		chartPuller: puller,
 	}
 }
 
@@ -81,15 +101,18 @@ func (a *actuator) Reconcile(ctx context.Context, log logr.Logger, ex *extension
 		return fmt.Errorf("failed to extract shoot metadata: %w", err)
 	}
 
-	// Read the addon manifest from the embedded FS
-	manifest, err := addonpkg.ReadManifest(embedded.Addons)
+	// Load addon config from ConfigMap (runtime) or embedded FS (fallback)
+	manifest, configMapValues, err := a.loadAddonConfig(ctx, log, ex.Namespace)
 	if err != nil {
-		return fmt.Errorf("failed to read addon manifest: %w", err)
+		return fmt.Errorf("failed to load addon config: %w", err)
+	}
+	if manifest == nil {
+		log.Info("No addon configuration found — nothing to deploy")
+		return nil
 	}
 
-	// Deploy seed-targeted addons once (first reconcile only).
-	// Pass the shoot's provider type so provider-specific values are loaded.
-	a.reconcileSeedAddons(ctx, log, ex.Namespace, meta.ProviderType)
+	// Deploy seed-targeted addons when manifest changes.
+	a.reconcileSeedAddons(ctx, log, ex.Namespace, meta.ProviderType, manifest, configMapValues)
 
 	// Resolve per-shoot config from the Extension CR's providerConfig
 	cfg, err := config.ResolveConfig(ex)
@@ -255,7 +278,7 @@ metadata:
 		ns := addon.GetNamespace(manifest.DefaultNamespace)
 		mrName := addon.GetManagedResourceName()
 
-		secretData, err := a.renderAddonChart(addon, meta, manifest)
+		secretData, err := a.renderAddonChart(addon, meta, manifest, configMapValues)
 		if err != nil {
 			return fmt.Errorf("failed to render chart for addon %s: %w", addon.Name, err)
 		}
@@ -319,9 +342,13 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 		return fmt.Errorf("failed to extract shoot metadata: %w", err)
 	}
 
-	manifest, err := addonpkg.ReadManifest(embedded.Addons)
+	manifest, _, err := a.loadAddonConfig(ctx, log, ex.Namespace)
 	if err != nil {
-		return fmt.Errorf("failed to read addon manifest: %w", err)
+		return fmt.Errorf("failed to load addon config: %w", err)
+	}
+	if manifest == nil {
+		log.Info("No addon configuration found — nothing to clean up")
+		return nil
 	}
 
 	prevStatus, err := config.GetPreviousStatus(ex)
@@ -438,78 +465,136 @@ func (a *actuator) Restore(ctx context.Context, log logr.Logger, ex *extensionsv
 }
 
 // --------------------------------------------------------------------------
+// Runtime addon config loading
+// --------------------------------------------------------------------------
+
+// loadAddonConfig reads addon configuration from the ConfigMap first, falling
+// back to embedded addons if the ConfigMap doesn't exist. Returns the manifest,
+// a map of values files from the ConfigMap (nil if using embedded), and an error.
+func (a *actuator) loadAddonConfig(ctx context.Context, log logr.Logger, namespace string) (*addonpkg.AddonManifest, map[string]string, error) {
+	cm := &corev1.ConfigMap{}
+	err := a.client.Get(ctx, types.NamespacedName{
+		Name:      ConfigMapName,
+		Namespace: namespace,
+	}, cm)
+
+	if err == nil {
+		// ConfigMap exists — parse manifest from it
+		log.Info("Using addon configuration from ConfigMap")
+		manifest, err := addonpkg.ReadManifestFromData(cm.Data["manifest.yaml"])
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse ConfigMap manifest: %w", err)
+		}
+		return manifest, cm.Data, nil
+	}
+
+	if !apierrors.IsNotFound(err) {
+		return nil, nil, fmt.Errorf("get addon config ConfigMap: %w", err)
+	}
+
+	// ConfigMap not found — try embedded fallback
+	manifest, err := addonpkg.ReadManifest(embedded.Addons)
+	if err != nil {
+		log.Info("No addon ConfigMap found and no embedded addons — nothing to deploy")
+		return nil, nil, nil
+	}
+
+	log.Info("Using embedded addon configuration (no ConfigMap found)")
+	return manifest, nil, nil
+}
+
+// parseYAMLValues parses a YAML string into a map for chart values merging.
+func parseYAMLValues(raw string) (map[string]interface{}, error) {
+	var vals map[string]interface{}
+	if err := yaml.Unmarshal([]byte(raw), &vals); err != nil {
+		return nil, err
+	}
+	if vals == nil {
+		vals = map[string]interface{}{}
+	}
+	return vals, nil
+}
+
+// computeManifestHash returns a short hash of the manifest for change detection.
+func computeManifestHash(manifest *addonpkg.AddonManifest) string {
+	data, _ := json.Marshal(manifest)
+	h := fmt.Sprintf("%x", data)
+	if len(h) > 16 {
+		h = h[:16]
+	}
+	return h
+}
+
+// --------------------------------------------------------------------------
 // Seed/runtime addon deployment
 // --------------------------------------------------------------------------
 
 // reconcileSeedAddons deploys addons with target "seed" or "global" to the
-// seed/runtime cluster as seed-class ManagedResources. Runs once per
-// controller lifetime (on the first shoot reconcile), since seed addons
-// don't change per-shoot.
-func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, namespace string, providerType string) {
-	a.seedAddonsOnce.Do(func() {
-		log.Info("Reconciling seed-targeted addons")
+// seed/runtime cluster as seed-class ManagedResources. Uses hash-based change
+// detection to redeploy when the manifest changes (e.g., ConfigMap update).
+func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, namespace string, providerType string, manifest *addonpkg.AddonManifest, configMapValues map[string]string) {
+	manifestHash := computeManifestHash(manifest)
 
-		manifest, err := addonpkg.ReadManifest(embedded.Addons)
-		if err != nil {
-			log.Error(err, "Failed to read addon manifest for seed addons")
-			return
-		}
+	a.mu.Lock()
+	if a.seedAddonsHash == manifestHash {
+		a.mu.Unlock()
+		return // No change since last reconciliation
+	}
+	a.seedAddonsHash = manifestHash
+	a.mu.Unlock()
 
-		seedName := os.Getenv("SEED_NAME")
-		region := os.Getenv("REGION")
-		if region == "" {
-			region = "us-gov-west-1"
-		}
+	log.Info("Reconciling seed-targeted addons", "manifestHash", manifestHash)
 
-		// Build a synthetic shootMetadata for template expansion.
-		// For seed addons, SeedName = this seed's name (from env).
-		// ProviderType is from the first shoot reconcile — ensures provider-specific
-		// values (e.g., values.aws.yaml) are loaded during chart rendering.
-		meta := &shootMetadata{
-			Name:         seedName,
-			SeedName:     seedName,
-			Region:       region,
-			ProviderType: providerType,
-		}
+	seedName := os.Getenv("SEED_NAME")
+	region := os.Getenv("REGION")
+	if region == "" {
+		region = "us-gov-west-1"
+	}
 
-		// Deploy target namespace
-		targetNS := manifest.DefaultNamespace
-		nsData := map[string][]byte{
-			"namespace.yaml": []byte(fmt.Sprintf(`apiVersion: v1
+	meta := &shootMetadata{
+		Name:         seedName,
+		SeedName:     seedName,
+		Region:       region,
+		ProviderType: providerType,
+	}
+
+	// Deploy target namespace
+	targetNS := manifest.DefaultNamespace
+	nsData := map[string][]byte{
+		"namespace.yaml": []byte(fmt.Sprintf(`apiVersion: v1
 kind: Namespace
 metadata:
   name: %s
   labels:
     pod-security.kubernetes.io/enforce: privileged
 `, targetNS)),
-		}
-		if err := managedresources.CreateForSeed(ctx, a.client, namespace, "seed-addon-namespace", false, nsData); err != nil {
-			log.Error(err, "Failed to deploy seed addon namespace")
-			return
-		}
+	}
+	if err := managedresources.CreateForSeed(ctx, a.client, namespace, "seed-addon-namespace", false, nsData); err != nil {
+		log.Error(err, "Failed to deploy seed addon namespace")
+		return
+	}
 
-		for i := range manifest.Addons {
-			addon := &manifest.Addons[i]
-			if !addon.DeploysToSeed() || !addon.Enabled {
-				continue
-			}
-
-			mrName := "seed-" + addon.GetManagedResourceName()
-
-			secretData, err := a.renderAddonChart(addon, meta, manifest)
-			if err != nil {
-				log.Error(err, "Failed to render seed addon chart", "addon", addon.Name)
-				continue
-			}
-
-			log.Info("Deploying seed addon ManagedResource", "addon", addon.Name, "managedResource", mrName)
-			if err := managedresources.CreateForSeed(ctx, a.client, namespace, mrName, false, secretData); err != nil {
-				log.Error(err, "Failed to deploy seed addon ManagedResource", "addon", addon.Name)
-			}
+	for i := range manifest.Addons {
+		addon := &manifest.Addons[i]
+		if !addon.DeploysToSeed() || !addon.Enabled {
+			continue
 		}
 
-		log.Info("Seed addon reconciliation complete")
-	})
+		mrName := "seed-" + addon.GetManagedResourceName()
+
+		secretData, err := a.renderAddonChart(addon, meta, manifest, configMapValues)
+		if err != nil {
+			log.Error(err, "Failed to render seed addon chart", "addon", addon.Name)
+			continue
+		}
+
+		log.Info("Deploying seed addon ManagedResource", "addon", addon.Name, "managedResource", mrName)
+		if err := managedresources.CreateForSeed(ctx, a.client, namespace, mrName, false, secretData); err != nil {
+			log.Error(err, "Failed to deploy seed addon ManagedResource", "addon", addon.Name)
+		}
+	}
+
+	log.Info("Seed addon reconciliation complete")
 }
 
 // --------------------------------------------------------------------------
@@ -1011,13 +1096,35 @@ data:
 //
 //	{{ .Region }}   -> meta.Region
 //	{{ .SeedName }} -> meta.SeedName
-func (a *actuator) renderAddonChart(addon *addonpkg.Addon, meta *shootMetadata, manifest *addonpkg.AddonManifest) (map[string][]byte, error) {
-	// Layer 1: base values.yaml from the addon's values path
+func (a *actuator) renderAddonChart(addon *addonpkg.Addon, meta *shootMetadata, manifest *addonpkg.AddonManifest, configMapValues map[string]string) (map[string][]byte, error) {
 	merged := map[string]interface{}{}
-	if addon.ValuesPath != "" {
+
+	if configMapValues != nil {
+		// ConfigMap mode: values come from ConfigMap keys
+		baseKey := fmt.Sprintf("values.%s.yaml", addon.Name)
+		if raw, ok := configMapValues[baseKey]; ok {
+			baseVals, err := parseYAMLValues(raw)
+			if err != nil {
+				return nil, fmt.Errorf("parse ConfigMap values %s: %w", baseKey, err)
+			}
+			merged = baseVals
+		}
+
+		// Provider-specific values from ConfigMap
+		if meta.ProviderType != "" {
+			providerKey := fmt.Sprintf("values.%s.%s.yaml", addon.Name, meta.ProviderType)
+			if raw, ok := configMapValues[providerKey]; ok {
+				providerVals, err := parseYAMLValues(raw)
+				if err != nil {
+					return nil, fmt.Errorf("parse ConfigMap values %s: %w", providerKey, err)
+				}
+				merged = mergeMaps(merged, providerVals)
+			}
+		}
+	} else if addon.ValuesPath != "" {
+		// Embedded mode: values from embedded FS (existing logic)
 		baseVals, err := readEmbeddedValues(embedded.Addons, "addons/"+addon.ValuesPath+"/values.yaml")
 		if err != nil {
-			// values.yaml is optional -- some addons may only have provider-specific
 			if !isNotExist(err) {
 				return nil, fmt.Errorf("read base values: %w", err)
 			}
@@ -1025,26 +1132,26 @@ func (a *actuator) renderAddonChart(addon *addonpkg.Addon, meta *shootMetadata, 
 			merged = baseVals
 		}
 
-		// Layer 2: provider-specific values
-		providerFile := fmt.Sprintf("addons/%s/values.%s.yaml", addon.ValuesPath, meta.ProviderType)
-		providerVals, err := readEmbeddedValues(embedded.Addons, providerFile)
-		if err != nil {
-			// Provider file is optional
-			if !isNotExist(err) {
-				return nil, fmt.Errorf("read provider values: %w", err)
+		if meta.ProviderType != "" {
+			providerFile := fmt.Sprintf("addons/%s/values.%s.yaml", addon.ValuesPath, meta.ProviderType)
+			providerVals, err := readEmbeddedValues(embedded.Addons, providerFile)
+			if err != nil {
+				if !isNotExist(err) {
+					return nil, fmt.Errorf("read provider values: %w", err)
+				}
+			} else {
+				merged = mergeMaps(merged, providerVals)
 			}
-		} else {
-			merged = mergeMaps(merged, providerVals)
 		}
 	}
 
-	// Layer 3: shoot values from the manifest (with template expansion)
+	// Shoot values from the manifest (with template expansion)
 	if addon.ShootValues != nil {
 		expanded := expandShootValues(addon.ShootValues, meta)
 		merged = mergeMaps(merged, expanded)
 	}
 
-	// Layer 4: imagePullSecrets from addon manifest
+	// imagePullSecrets from addon manifest
 	if len(addon.ImagePullSecrets) > 0 {
 		pullSecrets := make([]map[string]interface{}, len(addon.ImagePullSecrets))
 		for i, name := range addon.ImagePullSecrets {
@@ -1053,29 +1160,57 @@ func (a *actuator) renderAddonChart(addon *addonpkg.Addon, meta *shootMetadata, 
 		merged["imagePullSecrets"] = pullSecrets
 	}
 
-	// Layer 5: image overrides from environment variables
+	// Image overrides from environment variables
 	if addon.Image != nil {
 		applyImageOverride(merged, addon)
 	}
 
-	// Create a chart renderer using the REST config from the manager
+	// Create a chart renderer
 	renderer, err := chartrenderer.NewForConfig(a.restConfig)
 	if err != nil {
 		return nil, fmt.Errorf("create chart renderer: %w", err)
 	}
 
-	// Determine chart path and target namespace
-	chartPath := "addons/" + addon.Chart.Path
 	ns := addon.GetNamespace(manifest.DefaultNamespace)
 	releaseName := addon.GetManagedResourceName()
 
-	// Render the embedded chart
-	rendered, err := renderer.RenderEmbeddedFS(embedded.Addons, chartPath, releaseName, ns, merged)
-	if err != nil {
-		return nil, fmt.Errorf("render embedded chart %s: %w", chartPath, err)
+	var rendered *chartrenderer.RenderedChart
+
+	if addon.Chart.OCI != "" {
+		// OCI chart: pull from registry, render from archive
+		archive, err := a.pullOCIChart(addon)
+		if err != nil {
+			return nil, fmt.Errorf("pull OCI chart %s: %w", addon.Chart.OCI, err)
+		}
+		rendered, err = renderer.RenderArchive(archive, releaseName, ns, merged)
+		if err != nil {
+			return nil, fmt.Errorf("render OCI chart %s: %w", addon.Chart.OCI, err)
+		}
+	} else if addon.Chart.Path != "" {
+		// Embedded chart (existing path)
+		chartPath := "addons/" + addon.Chart.Path
+		rendered, err = renderer.RenderEmbeddedFS(embedded.Addons, chartPath, releaseName, ns, merged)
+		if err != nil {
+			return nil, fmt.Errorf("render embedded chart %s: %w", chartPath, err)
+		}
+	} else {
+		return nil, fmt.Errorf("addon %s: no chart source (oci or path) specified", addon.Name)
 	}
 
 	return rendered.AsSecretData(), nil
+}
+
+// pullOCIChart pulls a chart from OCI with fallback to cache.
+func (a *actuator) pullOCIChart(addon *addonpkg.Addon) ([]byte, error) {
+	if a.chartPuller == nil {
+		return nil, fmt.Errorf("OCI puller not initialized — cannot pull chart %s", addon.Chart.OCI)
+	}
+
+	result, err := a.chartPuller.Pull(context.Background(), addon.Chart.OCI, addon.Chart.Version)
+	if err != nil {
+		return nil, err
+	}
+	return result.Archive, nil
 }
 
 // readEmbeddedValues reads a YAML values file from the embedded FS and returns

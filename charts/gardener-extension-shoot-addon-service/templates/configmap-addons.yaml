@@ -1,0 +1,19 @@
+{{- if .Values.addons }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shoot-addon-service-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gardener-extension-shoot-addon-service
+    app.kubernetes.io/instance: shoot-addon-service
+data:
+  {{- if .Values.addons.manifest }}
+  manifest.yaml: |
+    {{- .Values.addons.manifest | nindent 4 }}
+  {{- end }}
+  {{- range $key, $value := .Values.addons.values }}
+  {{ $key }}: |
+    {{- $value | nindent 4 }}
+  {{- end }}
+{{- end }}

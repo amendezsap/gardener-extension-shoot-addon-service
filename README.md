@@ -124,7 +124,9 @@ For self-contained builds, addons can also be embedded at build time — see the
 
 ## Per-Shoot Configuration
 
-Shoots can override addon behavior via `providerConfig`:
+### Disable individual addons
+
+Use `providerConfig` to disable specific addons on a shoot without affecting others:
 
 ```yaml
 spec:
@@ -134,14 +136,51 @@ spec:
       addons:
         fluent-bit:
           enabled: false          # disable on this shoot
-        container-report:
-          enabled: true           # enable on this shoot
+        my-addon:
+          enabled: true           # keep enabled on this shoot
       aws:
         vpcEndpoint:
           enabled: true           # use VPC endpoint instead of NAT
 ```
 
-Or disable the extension entirely:
+The extension still runs on the shoot — it just skips the disabled addons. AWS infrastructure (IAM policies, VPC endpoints) remains in place.
+
+### Override addon values per shoot
+
+For debugging or per-shoot tuning, override specific values. Merge mode (default) only changes the keys you specify:
+
+```yaml
+providerConfig:
+  addons:
+    fluent-bit:
+      valuesOverride: |
+        config:
+          outputs: |
+            [OUTPUT]
+                Name stdout
+                Match *
+```
+
+For a full replacement of all values, use override mode:
+
+```yaml
+providerConfig:
+  addons:
+    fluent-bit:
+      valuesMode: override
+      valuesOverride: |
+        kind: DaemonSet
+        image:
+          repository: debug-image
+          tag: test
+```
+
+### Disable the extension entirely (full teardown)
+
+Setting `disabled: true` triggers the extension's Delete handler, which performs a complete teardown:
+- Deletes all addon ManagedResources (fluent-bit, container-report, etc.)
+- Detaches IAM policies from the shoot's node role
+- Deletes VPC endpoints (only if created by the extension and no other shoots use them)
 
 ```yaml
 spec:
@@ -149,6 +188,10 @@ spec:
   - type: shoot-addon-service
     disabled: true
 ```
+
+This is different from setting `enabled: false` on individual addons — `disabled: true` removes all AWS infrastructure and addon resources. Removing `disabled: true` and reconciling restores everything.
+
+**Note:** With `autoEnable: shoot` set on the Extension CR, the extension is automatically added to all shoots. To exclude a specific shoot, you must explicitly add `disabled: true` — you cannot remove it from the shoot spec (gardenlet re-adds it).
 
 ## AWS Features (provider-aws only)
 

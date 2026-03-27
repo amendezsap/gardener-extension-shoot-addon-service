@@ -45,11 +45,13 @@ const ConfigMapName = "shoot-addon-service-config"
 
 // actuator implements the extension.Actuator interface.
 type actuator struct {
-	client         client.Client
-	restConfig     *rest.Config
-	chartPuller    *oci.ChartPuller
-	seedAddonsHash string
-	mu             sync.Mutex
+	client             client.Client
+	restConfig         *rest.Config
+	chartPuller        *oci.ChartPuller
+	seedAddonsHash     string
+	managedSeedChecked bool
+	managedSeedResult  bool
+	mu                 sync.Mutex
 }
 
 // NewActuator creates a new actuator.
@@ -522,6 +524,65 @@ func parseYAMLValues(raw string) (map[string]interface{}, error) {
 	return vals, nil
 }
 
+// isManagedSeed checks if this seed is also a shoot managed by a parent seed.
+// On managed seeds, the parent extension deploys addons via shoot-class MRs,
+// so the managed seed's own extension should skip seed addon deployment.
+//
+// Detection: a managed seed has its gardenlet deployed by a parent. The parent
+// creates a control plane namespace like shoot--garden--<seedName> on the parent
+// cluster. But we can't check the parent cluster from here.
+//
+// Simpler: check if this seed's name appears as a shoot in the garden API.
+// If GARDEN_KUBECONFIG is available, query for a Shoot with the seed's name.
+// If found, this seed is managed.
+// isManagedSeed checks if this seed is also a shoot managed by a parent seed.
+// Cached after first check — seed status doesn't change during controller lifetime.
+func (a *actuator) isManagedSeed(ctx context.Context, log logr.Logger, seedName string) bool {
+	if seedName == "" {
+		return false
+	}
+
+	a.mu.Lock()
+	if a.managedSeedChecked {
+		result := a.managedSeedResult
+		a.mu.Unlock()
+		return result
+	}
+	a.mu.Unlock()
+
+	result := a.checkManagedSeed(ctx, log, seedName)
+
+	a.mu.Lock()
+	a.managedSeedChecked = true
+	a.managedSeedResult = result
+	a.mu.Unlock()
+
+	return result
+}
+
+func (a *actuator) checkManagedSeed(ctx context.Context, log logr.Logger, seedName string) bool {
+	gardenClient, err := a.getGardenClient()
+	if err != nil {
+		return false
+	}
+
+	shootList := &gardencorev1beta1.ShootList{}
+	if err := gardenClient.List(ctx, shootList); err != nil {
+		log.Error(err, "Failed to list shoots for managed seed detection")
+		return false
+	}
+
+	for _, s := range shootList.Items {
+		if s.Name == seedName {
+			log.Info("Seed is a managed seed (shoot exists with same name)",
+				"seedName", seedName, "shootNamespace", s.Namespace)
+			return true
+		}
+	}
+
+	return false
+}
+
 // getExtensionNamespace returns the namespace where the extension controller pod
 // runs. This is where the addon ConfigMap is deployed by the Helm chart.
 func getExtensionNamespace() string {
@@ -551,6 +612,20 @@ func computeManifestHash(manifest *addonpkg.AddonManifest) string {
 // seed/runtime cluster as seed-class ManagedResources. Uses hash-based change
 // detection to redeploy when the manifest changes (e.g., ConfigMap update).
 func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, namespace string, providerType string, manifest *addonpkg.AddonManifest, configMapValues map[string]string) {
+	// On managed seeds, the parent seed's extension already deploys addons via
+	// shoot-class ManagedResources into the shoot cluster (which IS the managed
+	// seed). Skip seed addon deployment to avoid duplicates.
+	//
+	// Detection: check if this seed is also a shoot by looking for a shoot-class
+	// addon ManagedResource targeting this seed. If an addon MR already exists
+	// from the parent extension, skip seed addons.
+	seedName := os.Getenv("SEED_NAME")
+	if a.isManagedSeed(ctx, log, seedName) {
+		log.Info("Skipping seed addon deployment — managed seed, parent extension deploys via shoot MR",
+			"seedName", seedName)
+		return
+	}
+
 	manifestHash := computeManifestHash(manifest)
 
 	a.mu.Lock()
@@ -562,8 +637,6 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 	a.mu.Unlock()
 
 	log.Info("Reconciling seed-targeted addons", "manifestHash", manifestHash)
-
-	seedName := os.Getenv("SEED_NAME")
 	region := os.Getenv("REGION")
 	if region == "" {
 		region = "us-gov-west-1"

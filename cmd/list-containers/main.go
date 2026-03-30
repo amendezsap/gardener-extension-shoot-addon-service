@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and contributors
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -21,7 +24,7 @@ func main() {
 
 	cmd := &cobra.Command{
 		Use:   "list-containers",
-		Short: "List running containers in a Kubernetes cluster",
+		Short: "List running container images in a Kubernetes cluster",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if showVersion {
 				fmt.Println(version)
@@ -31,11 +34,11 @@ func main() {
 		},
 	}
 
-	cmd.Flags().BoolVar(&showSHA256, "sha256", false, "Display container images as SHA256 values")
-	cmd.Flags().BoolVar(&verbose, "verbose", false, "Show namespace/pod_name with image path")
+	cmd.Flags().BoolVar(&showSHA256, "sha256", false, "Prefer SHA256 digest over tag")
+	cmd.Flags().BoolVar(&verbose, "verbose", false, "Show namespace/pod with image")
 	cmd.Flags().BoolVar(&onlyDigest, "only-digest", false, "Show only images with sha256 digests")
 	cmd.Flags().BoolVar(&showVersion, "version", false, "Show version and exit")
-	cmd.Flags().StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file (optional)")
+	cmd.Flags().StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file")
 
 	if err := cmd.Execute(); err != nil {
 		os.Exit(1)
@@ -58,36 +61,26 @@ func run(kubeconfig string, showSHA256, verbose, onlyDigest bool) error {
 		return fmt.Errorf("list pods: %w", err)
 	}
 
+	seen := make(map[string]bool)
 	for _, pod := range pods.Items {
-		if pod.Status.ContainerStatuses == nil {
-			continue
-		}
 		for _, cs := range pod.Status.ContainerStatuses {
-			var imageDisplay string
-
-			if showSHA256 {
-				// Use image_id if it contains @sha256: (matches Python behavior)
-				if cs.ImageID != "" && strings.Contains(cs.ImageID, "@sha256:") {
-					imageDisplay = cs.ImageID
-				} else {
-					imageDisplay = cs.Image // fallback
-				}
-			} else {
-				imageDisplay = cs.Image
+			display := cs.Image
+			if showSHA256 && strings.Contains(cs.ImageID, "@sha256:") {
+				display = strings.SplitN(cs.ImageID, "://", 2)[len(strings.SplitN(cs.ImageID, "://", 2))-1]
 			}
 
-			var line string
-			if verbose {
-				line = fmt.Sprintf("%s/%s: %s", pod.Namespace, pod.Name, imageDisplay)
-			} else {
-				line = imageDisplay
-			}
-
-			if onlyDigest && !strings.Contains(line, "@sha256:") {
+			if onlyDigest && !strings.Contains(display, "@sha256:") {
 				continue
 			}
 
-			fmt.Println(line)
+			if verbose {
+				display = fmt.Sprintf("%s/%s: %s", pod.Namespace, pod.Name, display)
+			}
+
+			if !seen[display] {
+				seen[display] = true
+				fmt.Println(display)
+			}
 		}
 	}
 

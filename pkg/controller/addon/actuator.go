@@ -2,6 +2,7 @@ package addon
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -602,16 +603,6 @@ func getExtensionNamespace() string {
 	return ""
 }
 
-// computeManifestHash returns a short hash of the manifest for change detection.
-func computeManifestHash(manifest *addonpkg.AddonManifest) string {
-	data, _ := json.Marshal(manifest)
-	h := fmt.Sprintf("%x", data)
-	if len(h) > 16 {
-		h = h[:16]
-	}
-	return h
-}
-
 // --------------------------------------------------------------------------
 // Seed/runtime addon deployment
 // --------------------------------------------------------------------------
@@ -647,17 +638,6 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 		return
 	}
 
-	manifestHash := computeManifestHash(manifest)
-
-	a.mu.Lock()
-	if a.seedAddonsHash == manifestHash {
-		a.mu.Unlock()
-		return // No change since last reconciliation
-	}
-	a.seedAddonsHash = manifestHash
-	a.mu.Unlock()
-
-	log.Info("Reconciling seed-targeted addons", "manifestHash", manifestHash)
 	region := os.Getenv("REGION")
 	if region == "" {
 		region = "us-gov-west-1"
@@ -670,6 +650,51 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 		Region:       region,
 		ProviderType: providerType,
 	}
+
+	// Render all seed addon charts first, then hash the rendered output.
+	// This ensures any change — manifest, config values, template variables,
+	// or code — triggers re-deployment.
+	type renderedAddon struct {
+		addon      *addonpkg.Addon
+		mrName     string
+		secretData map[string][]byte
+	}
+	var rendered []renderedAddon
+	h := sha256.New()
+
+	for i := range manifest.Addons {
+		addon := &manifest.Addons[i]
+		if !addon.DeploysToSeed() || !addon.Enabled {
+			continue
+		}
+
+		secretData, err := a.renderAddonChart(addon, meta, manifest, configMapValues, nil)
+		if err != nil {
+			log.Error(err, "Failed to render seed addon chart", "addon", addon.Name)
+			continue
+		}
+
+		mrName := "seed-" + addon.GetManagedResourceName()
+		rendered = append(rendered, renderedAddon{addon, mrName, secretData})
+
+		// Hash the rendered output for change detection
+		for k, v := range secretData {
+			h.Write([]byte(k))
+			h.Write(v)
+		}
+	}
+
+	outputHash := fmt.Sprintf("%x", h.Sum(nil))[:16]
+
+	a.mu.Lock()
+	if a.seedAddonsHash == outputHash {
+		a.mu.Unlock()
+		return // No change since last reconciliation
+	}
+	a.seedAddonsHash = outputHash
+	a.mu.Unlock()
+
+	log.Info("Reconciling seed-targeted addons", "outputHash", outputHash)
 
 	// Deploy target namespace
 	targetNS := manifest.DefaultNamespace
@@ -687,23 +712,10 @@ metadata:
 		return
 	}
 
-	for i := range manifest.Addons {
-		addon := &manifest.Addons[i]
-		if !addon.DeploysToSeed() || !addon.Enabled {
-			continue
-		}
-
-		mrName := "seed-" + addon.GetManagedResourceName()
-
-		secretData, err := a.renderAddonChart(addon, meta, manifest, configMapValues, nil)
-		if err != nil {
-			log.Error(err, "Failed to render seed addon chart", "addon", addon.Name)
-			continue
-		}
-
-		log.Info("Deploying seed addon ManagedResource", "addon", addon.Name, "managedResource", mrName)
-		if err := managedresources.CreateForSeed(ctx, a.client, namespace, mrName, false, secretData); err != nil {
-			log.Error(err, "Failed to deploy seed addon ManagedResource", "addon", addon.Name)
+	for _, r := range rendered {
+		log.Info("Deploying seed addon ManagedResource", "addon", r.addon.Name, "managedResource", r.mrName)
+		if err := managedresources.CreateForSeed(ctx, a.client, namespace, r.mrName, false, r.secretData); err != nil {
+			log.Error(err, "Failed to deploy seed addon ManagedResource", "addon", r.addon.Name)
 		}
 	}
 

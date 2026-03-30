@@ -666,6 +666,7 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 	meta := &shootMetadata{
 		Name:         seedName,
 		SeedName:     seedName,
+		Project:      seedName,
 		Region:       region,
 		ProviderType: providerType,
 	}

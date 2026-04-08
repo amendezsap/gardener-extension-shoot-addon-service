@@ -739,7 +739,7 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 
 	region := os.Getenv("REGION")
 	if region == "" {
-		region = "us-gov-west-1"
+		region = "us-east-1"
 	}
 
 	meta := &shootMetadata{

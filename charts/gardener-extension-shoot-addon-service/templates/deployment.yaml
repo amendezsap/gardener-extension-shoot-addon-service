@@ -50,6 +50,10 @@ spec:
               value: {{ $override.tag | quote }}
             {{- end }}
             {{- end }}
+            {{- if .Values.region }}
+            - name: REGION
+              value: {{ .Values.region | quote }}
+            {{- end }}
             - name: OCI_CHART_CACHE_DIR
               value: {{ .Values.ociChartCacheDir | quote }}
           ports:

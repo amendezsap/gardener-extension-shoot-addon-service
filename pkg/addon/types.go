@@ -22,6 +22,12 @@ type AddonManifest struct {
 	// Use this for node-level policies (SSM, CloudWatch) that aren't tied to
 	// any specific addon.
 	GlobalAWS *GlobalAWSConfig `json:"globalAWS,omitempty" yaml:"globalAWS,omitempty"`
+
+	// GlobalGCP defines GCP infrastructure that is always provisioned when the
+	// extension is active on a GCP shoot, regardless of which addons are enabled.
+	// Use this for project-level IAM role bindings that aren't tied to any
+	// specific addon.
+	GlobalGCP *GlobalGCPConfig `json:"globalGCP,omitempty" yaml:"globalGCP,omitempty"`
 }
 
 // GlobalAWSConfig defines AWS infrastructure applied to every shoot where
@@ -38,6 +44,16 @@ type GlobalAWSConfig struct {
 	// Enabled/disabled via Helm value defaults.aws.vpcEndpoint.enabled
 	// and per-shoot providerConfig override.
 	VPCEndpoints []VPCEndpointSpec `json:"vpcEndpoints,omitempty" yaml:"vpcEndpoints,omitempty"`
+}
+
+// GlobalGCPConfig defines GCP infrastructure applied to every shoot where
+// the extension is enabled and the provider is GCP. These are project-level
+// IAM concerns, not addon-specific.
+type GlobalGCPConfig struct {
+	// IAMRoles are GCP IAM roles bound to the shoot's node service account
+	// at the project level. These apply regardless of which addons are enabled.
+	// Examples: roles/logging.logWriter, roles/monitoring.metricWriter.
+	IAMRoles []string `json:"iamRoles,omitempty" yaml:"iamRoles,omitempty"`
 }
 
 // AddonTarget specifies where an addon should be deployed.

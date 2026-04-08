@@ -38,6 +38,7 @@ import (
 	"github.com/amendezsap/gardener-extension-shoot-addon-service/pkg/addon/oci"
 	"github.com/amendezsap/gardener-extension-shoot-addon-service/pkg/apis/config"
 	awsutil "github.com/amendezsap/gardener-extension-shoot-addon-service/pkg/aws"
+	gcputil "github.com/amendezsap/gardener-extension-shoot-addon-service/pkg/gcp"
 	"github.com/amendezsap/gardener-extension-shoot-addon-service/charts/embedded"
 )
 
@@ -77,18 +78,19 @@ func NewActuator(mgr manager.Manager) *actuator {
 
 // shootMetadata holds extracted shoot info needed for reconciliation.
 type shootMetadata struct {
-	Name              string
-	Namespace         string
-	Project           string
-	ControlNamespace  string
-	Region            string
-	ProviderType      string
-	VpcID             string
-	WorkerCIDRs       []string
-	NodeRoleName      string
-	NodeSecurityGroup string // from Infrastructure status
-	Partition         string
-	SeedName          string
+	Name                  string
+	Namespace             string
+	Project               string
+	ControlNamespace      string
+	Region                string
+	ProviderType          string
+	VpcID                 string
+	WorkerCIDRs           []string
+	NodeRoleName          string
+	NodeSecurityGroup     string // from Infrastructure status (AWS)
+	Partition             string
+	SeedName              string
+	GCPNodeServiceAccount string // from Infrastructure status (GCP)
 }
 
 // Reconcile creates/updates IAM policies, VPC endpoints, and deploys addon
@@ -146,6 +148,19 @@ func (a *actuator) Reconcile(ctx context.Context, log logr.Logger, ex *extension
 		}
 	} else {
 		log.Info("Non-AWS shoot — skipping IAM policies and VPC endpoint management", "provider", meta.ProviderType)
+	}
+
+	// GCP-specific features (IAM role bindings) only apply to shoots using provider-gcp.
+	var gcpClient *gcputil.Client
+	if meta.ProviderType == "gcp" {
+		gcpCreds, err := a.getGCPCloudProviderCredentials(ctx, ex.Namespace)
+		if err != nil {
+			return fmt.Errorf("failed to get GCP cloud provider credentials: %w", err)
+		}
+		gcpClient, err = gcputil.NewClient(gcpCreds)
+		if err != nil {
+			return fmt.Errorf("failed to create GCP client: %w", err)
+		}
 	}
 
 	newStatus := &config.ProviderStatus{
@@ -257,6 +272,41 @@ metadata:
 		}
 	}
 
+	// Global GCP: bind IAM roles to the shoot's node service account
+	var currentGCPRoles []string
+	if meta.ProviderType == "gcp" && manifest.GlobalGCP != nil && len(manifest.GlobalGCP.IAMRoles) > 0 {
+		if meta.GCPNodeServiceAccount == "" {
+			log.Info("No GCP node service account found in Infrastructure status, skipping IAM role bindings")
+		} else {
+			member := fmt.Sprintf("serviceAccount:%s", meta.GCPNodeServiceAccount)
+			log.Info("Ensuring global GCP IAM role bindings", "serviceAccount", meta.GCPNodeServiceAccount)
+			for _, role := range manifest.GlobalGCP.IAMRoles {
+				if err := gcpClient.AddIAMPolicyBinding(ctx, member, role); err != nil {
+					return fmt.Errorf("failed to add GCP IAM binding %s for %s: %w", role, member, err)
+				}
+				log.Info("GCP IAM role bound", "role", role, "member", member)
+				currentGCPRoles = append(currentGCPRoles, role)
+			}
+
+			// Remove roles that were previously bound but removed from the manifest
+			if prevStatus != nil && len(prevStatus.GlobalGCPIAMRoles) > 0 {
+				currentSet := make(map[string]bool, len(currentGCPRoles))
+				for _, r := range currentGCPRoles {
+					currentSet[r] = true
+				}
+				for _, prevRole := range prevStatus.GlobalGCPIAMRoles {
+					if !currentSet[prevRole] {
+						log.Info("Removing stale GCP IAM role binding", "role", prevRole, "member", member)
+						if err := gcpClient.RemoveIAMPolicyBinding(ctx, member, prevRole); err != nil {
+							log.Error(err, "Failed to remove stale GCP IAM role binding", "role", prevRole)
+							// Non-fatal — role may have been manually removed already
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// Process each addon in the manifest (shoot-targeted only)
 	for i := range manifest.Addons {
 		addon := &manifest.Addons[i]
@@ -315,6 +365,8 @@ metadata:
 
 	// Track global IAM policies in status for stale policy detection
 	newStatus.GlobalIAMPolicies = currentGlobalPolicies
+	newStatus.GlobalGCPIAMRoles = currentGCPRoles
+	newStatus.GCPNodeServiceAccount = meta.GCPNodeServiceAccount
 
 	// Delete stale GRM ConfigMaps that are missing our namespaces.
 	// If a stale ConfigMap is found and deleted, trigger a shoot reconcile
@@ -447,6 +499,53 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 							errs = append(errs, err)
 						}
 					}
+				}
+			}
+		}
+	}
+
+	// 3. Clean up GCP resources if this is a GCP shoot
+	if meta.ProviderType == "gcp" {
+		gcpCreds, err := a.getGCPCloudProviderCredentials(ctx, ex.Namespace)
+		if err != nil {
+			log.Error(err, "Failed to get GCP cloud provider credentials, skipping GCP cleanup")
+		} else {
+			gcpClient, err := gcputil.NewClient(gcpCreds)
+			if err != nil {
+				log.Error(err, "Failed to create GCP client")
+			} else {
+				// Determine the node service account from previous status or current metadata
+				nodeServiceAccount := meta.GCPNodeServiceAccount
+				if nodeServiceAccount == "" && prevStatus != nil {
+					nodeServiceAccount = prevStatus.GCPNodeServiceAccount
+				}
+
+				if nodeServiceAccount != "" {
+					member := fmt.Sprintf("serviceAccount:%s", nodeServiceAccount)
+
+					// Unbind roles from manifest
+					if manifest.GlobalGCP != nil && len(manifest.GlobalGCP.IAMRoles) > 0 {
+						log.Info("Removing GCP IAM role bindings", "serviceAccount", nodeServiceAccount)
+						for _, role := range manifest.GlobalGCP.IAMRoles {
+							if err := gcpClient.RemoveIAMPolicyBinding(ctx, member, role); err != nil {
+								log.Error(err, "Failed to remove GCP IAM role binding", "role", role)
+								errs = append(errs, err)
+							}
+						}
+					}
+
+					// Also unbind any roles tracked in previous status that may have
+					// been removed from the manifest since the last reconcile
+					if prevStatus != nil && len(prevStatus.GlobalGCPIAMRoles) > 0 {
+						for _, role := range prevStatus.GlobalGCPIAMRoles {
+							if err := gcpClient.RemoveIAMPolicyBinding(ctx, member, role); err != nil {
+								log.Error(err, "Failed to remove previously tracked GCP IAM role binding", "role", role)
+								// Non-fatal
+							}
+						}
+					}
+				} else {
+					log.Info("No GCP node service account available, skipping IAM cleanup")
 				}
 			}
 		}
@@ -1025,8 +1124,11 @@ func (a *actuator) extractShootMetadata(cluster *extensionscontroller.Cluster, n
 		vpcID, workerCIDRs = parseInfraConfig(raw)
 	}
 
-	// Extract node security group from Infrastructure status
+	// Extract node security group from Infrastructure status (AWS)
 	nodeSG := a.getNodeSecurityGroupFromInfraStatus(cluster, namespace)
+
+	// Extract GCP node service account from Infrastructure status (GCP)
+	gcpNodeSA := a.getGCPNodeServiceAccountFromInfraStatus(cluster, namespace)
 
 	seedName := ""
 	if shoot.Spec.SeedName != nil {
@@ -1034,18 +1136,19 @@ func (a *actuator) extractShootMetadata(cluster *extensionscontroller.Cluster, n
 	}
 
 	return &shootMetadata{
-		Name:              shoot.Name,
-		Namespace:         shoot.Namespace,
-		Project:           project,
-		ControlNamespace:  namespace,
-		Region:            region,
-		ProviderType:      shoot.Spec.Provider.Type,
-		VpcID:             vpcID,
-		WorkerCIDRs:       workerCIDRs,
-		NodeRoleName:      fmt.Sprintf("%s-nodes", namespace),
-		NodeSecurityGroup: nodeSG,
-		Partition:         partition,
-		SeedName:          seedName,
+		Name:                  shoot.Name,
+		Namespace:             shoot.Namespace,
+		Project:               project,
+		ControlNamespace:      namespace,
+		Region:                region,
+		ProviderType:          shoot.Spec.Provider.Type,
+		VpcID:                 vpcID,
+		WorkerCIDRs:           workerCIDRs,
+		NodeRoleName:          fmt.Sprintf("%s-nodes", namespace),
+		NodeSecurityGroup:     nodeSG,
+		Partition:             partition,
+		SeedName:              seedName,
+		GCPNodeServiceAccount: gcpNodeSA,
 	}, nil
 }
 
@@ -1154,6 +1257,64 @@ func (a *actuator) getCloudProviderCredentials(ctx context.Context, namespace st
 		RoleARN:        string(secret.Data["roleARN"]),
 		Token:          string(secret.Data["token"]),
 	}, nil
+}
+
+// getGCPCloudProviderCredentials reads the cloudprovider secret from the shoot's
+// control plane namespace and extracts GCP service account JSON.
+func (a *actuator) getGCPCloudProviderCredentials(ctx context.Context, namespace string) (*gcputil.Credentials, error) {
+	secret := &corev1.Secret{}
+	if err := a.client.Get(ctx, types.NamespacedName{
+		Name:      "cloudprovider",
+		Namespace: namespace,
+	}, secret); err != nil {
+		return nil, fmt.Errorf("failed to get cloudprovider secret in %s: %w", namespace, err)
+	}
+
+	serviceAccountJSON := secret.Data["serviceaccount.json"]
+	if len(serviceAccountJSON) == 0 {
+		return nil, fmt.Errorf("cloudprovider secret in %s is missing required field serviceaccount.json", namespace)
+	}
+
+	return &gcputil.Credentials{
+		ServiceAccountJSON: serviceAccountJSON,
+	}, nil
+}
+
+// getGCPNodeServiceAccountFromInfraStatus reads the node service account email
+// from the Infrastructure status providerStatus. The GCP Infrastructure controller
+// stores this after creating the shoot's GCP infrastructure.
+//
+// Path: infrastructure.status.providerStatus.serviceAccountEmail
+func (a *actuator) getGCPNodeServiceAccountFromInfraStatus(cluster *extensionscontroller.Cluster, namespace string) string {
+	infra := &extensionsv1alpha1.Infrastructure{}
+	shootName := ""
+	if cluster.Shoot != nil {
+		shootName = cluster.Shoot.Name
+	}
+	if shootName == "" {
+		return ""
+	}
+
+	if err := a.client.Get(context.Background(), types.NamespacedName{
+		Name:      shootName,
+		Namespace: namespace,
+	}, infra); err != nil {
+		return ""
+	}
+
+	if infra.Status.ProviderStatus == nil || infra.Status.ProviderStatus.Raw == nil {
+		return ""
+	}
+
+	var status struct {
+		ServiceAccountEmail string `json:"serviceAccountEmail"`
+	}
+
+	if err := json.Unmarshal(infra.Status.ProviderStatus.Raw, &status); err != nil {
+		return ""
+	}
+
+	return status.ServiceAccountEmail
 }
 
 // deleteManagedResource deletes a ManagedResource and waits for it to be gone.

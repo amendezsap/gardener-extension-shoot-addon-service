@@ -193,13 +193,33 @@ This is different from setting `enabled: false` on individual addons — `disabl
 
 **Note:** With `autoEnable: shoot` set on the Extension CR, the extension is automatically added to all shoots. To exclude a specific shoot, you must explicitly add `disabled: true` — you cannot remove it from the shoot spec (gardenlet re-adds it).
 
+## Multi-Provider Support
+
+The extension detects the cloud provider from `Shoot.Spec.Provider.Type` and applies provider-specific behavior automatically. Chart deployment works on all providers. IAM management is provider-specific.
+
+### Provider Detection
+
+Each shoot's provider type (`aws`, `gcp`, `openstack`, etc.) is read from the Shoot spec. The extension:
+- Deploys addon charts to all shoots regardless of provider
+- Applies provider-specific values overlays (`values.<addon>.<provider>.yaml`)
+- Manages provider-specific IAM configuration only for supported providers
+- Skips unsupported provider features silently
+
+### Provider-Specific Values Overlays
+
+Addon values are layered by provider. For a Fluent Bit addon on a GCP shoot, the extension merges:
+1. `values.fluent-bit.yaml` (base values)
+2. `values.fluent-bit.gcp.yaml` (GCP-specific outputs, e.g., Stackdriver)
+
+On AWS, it would merge `values.fluent-bit.aws.yaml` instead (e.g., CloudWatch outputs). This allows a single addon definition to target multiple providers with different backend configurations.
+
+### Global Provider Config
+
+Provider-specific infrastructure (IAM policies, VPC endpoints, IAM role bindings) is configured in the manifest's `globalAWS` and `globalGCP` sections. These apply to all shoots on that provider regardless of which addons are enabled.
+
 ## AWS Features (provider-aws only)
 
-AWS infrastructure management **only applies to shoots using `provider-aws`**. Non-AWS shoots (GCP, OpenStack, etc.) get chart deployment only — IAM and VPC endpoint steps are skipped automatically.
-
-> **Future:** GCP IAM equivalent (Workload Identity, service account binding) is planned but not yet implemented.
-
-**Global IAM Policies** — node-level, attached regardless of which addons are enabled:
+**Global IAM Policies** -- attached to the shoot's node role:
 ```yaml
 globalAWS:
   iamPolicies:
@@ -207,7 +227,7 @@ globalAWS:
     - AmazonSSMManagedInstanceCore
 ```
 
-**Global VPC Endpoints** — created in the shoot's VPC with the Gardener node security group. Configured in the manifest's `globalAWS` section (not per-addon):
+**Global VPC Endpoints** -- created in the shoot's VPC with the Gardener node security group:
 ```yaml
 globalAWS:
   vpcEndpoints:
@@ -217,6 +237,49 @@ globalAWS:
 VPC endpoints support shared VPCs (tag-based tracking prevents premature deletion) and are configurable per-shoot via `providerConfig`.
 
 IAM policies removed from `globalAWS.iamPolicies` are automatically detached on the next reconcile (stale policy detection via ProviderStatus).
+
+## GCP Features (provider-gcp only)
+
+**Global IAM Role Bindings** -- bound to the shoot's node service account at the project level:
+```yaml
+globalGCP:
+  iamRoles:
+    - roles/logging.logWriter
+    - roles/monitoring.metricWriter
+```
+
+The node service account email is extracted from the Infrastructure CR status (`serviceAccountEmail`). IAM role bindings use `serviceAccount:<email>` member format and are managed idempotently with etag-based conflict retry.
+
+Roles removed from `globalGCP.iamRoles` are automatically unbound on the next reconcile (stale role detection via ProviderStatus).
+
+### Example: Multi-Provider Manifest
+
+```yaml
+apiVersion: addons.gardener.cloud/v1alpha1
+kind: AddonManifest
+defaultNamespace: observability
+globalAWS:
+  iamPolicies:
+    - CloudWatchAgentServerPolicy
+  vpcEndpoints:
+    - service: logs
+globalGCP:
+  iamRoles:
+    - roles/logging.logWriter
+    - roles/monitoring.metricWriter
+addons:
+  - name: fluent-bit
+    chart:
+      oci: oci://registry.example.com/charts/fluent-bit
+      version: "0.56.0"
+    valuesPath: fluent-bit/values
+    enabled: true
+```
+
+With provider-specific values files:
+- `values.fluent-bit.yaml` -- base config (shared across all providers)
+- `values.fluent-bit.aws.yaml` -- CloudWatch Logs output
+- `values.fluent-bit.gcp.yaml` -- Stackdriver/Cloud Logging output
 
 ## Values Layering
 

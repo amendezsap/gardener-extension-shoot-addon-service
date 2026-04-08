@@ -50,6 +50,9 @@ func GenerateJSONSchema() ([]byte, error) {
 		},
 	}
 
+	// Add globalGCP schema at the top level alongside globalAWS
+	schema.Properties["globalGCP"] = globalGCPSchema()
+
 	return json.MarshalIndent(schema, "", "  ")
 }
 
@@ -149,6 +152,22 @@ func imageOverrideSchema() *jsonSchema {
 			"defaultTag": {
 				Type:        "string",
 				Description: "Default container image tag if not overridden.",
+			},
+		},
+	}
+}
+
+func globalGCPSchema() *jsonSchema {
+	return &jsonSchema{
+		Type:        "object",
+		Description: "GCP infrastructure applied to every shoot where the extension is enabled and the provider is GCP.",
+		Properties: map[string]*jsonSchema{
+			"iamRoles": {
+				Type:        "array",
+				Description: "GCP IAM roles bound to the shoot's node service account at the project level. Examples: roles/logging.logWriter, roles/monitoring.metricWriter.",
+				Items: &jsonSchema{
+					Type: "string",
+				},
 			},
 		},
 	}

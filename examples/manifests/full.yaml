@@ -11,6 +11,12 @@ globalAWS:
   vpcEndpoints:
     - service: logs
 
+# Global GCP — project-level IAM roles (provider-gcp only, skipped on other providers)
+globalGCP:
+  iamRoles:
+    - roles/logging.logWriter
+    - roles/monitoring.metricWriter
+
 addons:
   # OCI chart source — pulled at build time from ghcr.io
   - name: fluent-bit

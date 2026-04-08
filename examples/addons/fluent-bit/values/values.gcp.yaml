@@ -1,0 +1,10 @@
+# GCP-specific values for Fluent Bit Google Cloud Logging output.
+# Merged on top of values.yaml when the shoot runs on GCP.
+config:
+  outputs: |
+    [OUTPUT]
+        Name                stackdriver
+        Match               *
+        resource            k8s_node
+        k8s_cluster_name    {{ .ShootName }}
+        k8s_cluster_location {{ .Region }}

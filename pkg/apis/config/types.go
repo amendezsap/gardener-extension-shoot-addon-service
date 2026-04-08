@@ -12,10 +12,11 @@ import (
 )
 
 // AddonServiceConfig is the providerConfig for the shoot-addon-service extension.
-// It allows per-addon overrides and AWS-specific configuration.
+// It allows per-addon overrides and provider-specific configuration.
 type AddonServiceConfig struct {
 	Addons map[string]AddonOverride `json:"addons,omitempty"`
 	AWS    *AWSOverride             `json:"aws,omitempty"`
+	GCP    *GCPOverride             `json:"gcp,omitempty"`
 }
 
 // AddonOverride allows enabling/disabling individual addons and overriding
@@ -48,6 +49,10 @@ type VPCEndpointOverride struct {
 	Enabled *bool `json:"enabled,omitempty"`
 }
 
+// GCPOverride holds GCP-specific configuration overrides.
+type GCPOverride struct {
+}
+
 // ProviderStatus tracks state persisted on the Extension resource.
 type ProviderStatus struct {
 	Addons map[string]*AddonStatus `json:"addons,omitempty"`
@@ -56,6 +61,12 @@ type ProviderStatus struct {
 	GlobalIAMPolicies []string `json:"globalIAMPolicies,omitempty"`
 	// VPCEndpoint tracks the global VPC endpoint state.
 	VPCEndpoint *VPCEndpointStatus `json:"vpcEndpoint,omitempty"`
+	// GlobalGCPIAMRoles tracks which GCP IAM roles were bound on the last
+	// reconcile. Used to detect removals and unbind stale roles.
+	GlobalGCPIAMRoles []string `json:"globalGCPIAMRoles,omitempty"`
+	// GCPNodeServiceAccount is the GCP service account email used by shoot
+	// nodes, extracted from the Infrastructure status.
+	GCPNodeServiceAccount string `json:"gcpNodeServiceAccount,omitempty"`
 }
 
 // AddonStatus holds the state for a single addon.

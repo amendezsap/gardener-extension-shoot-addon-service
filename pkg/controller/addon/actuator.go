@@ -850,7 +850,9 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 
 	log.Info("Reconciling seed-targeted addons", "outputHash", outputHash)
 
-	// Deploy target namespace
+	// Deploy target namespace with gardener.cloud/role: extension label so the
+	// seed GRM's restricted informer cache includes it. Without this label, the
+	// GRM can't manage resources in the namespace on newer Gardener versions.
 	targetNS := manifest.DefaultNamespace
 	nsData := map[string][]byte{
 		"namespace.yaml": []byte(fmt.Sprintf(`apiVersion: v1
@@ -859,6 +861,7 @@ metadata:
   name: %s
   labels:
     pod-security.kubernetes.io/enforce: privileged
+    gardener.cloud/role: extension
 `, targetNS)),
 	}
 	if err := managedresources.CreateForSeed(ctx, a.client, namespace, "seed-addon-namespace", false, nsData); err != nil {

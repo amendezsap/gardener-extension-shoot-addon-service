@@ -50,10 +50,12 @@ type actuator struct {
 	client             client.Client
 	restConfig         *rest.Config
 	chartPuller        *oci.ChartPuller
-	seedAddonsHash     string
-	managedSeedChecked bool
-	managedSeedResult  bool
-	mu                 sync.Mutex
+	seedAddonsHash      string
+	managedSeedChecked  bool
+	managedSeedResult   bool
+	seedProviderType    string
+	seedProviderChecked bool
+	mu                  sync.Mutex
 }
 
 // NewActuator creates a new actuator.
@@ -691,6 +693,50 @@ func (a *actuator) checkManagedSeed(ctx context.Context, log logr.Logger, seedNa
 	return false
 }
 
+// getSeedProviderType returns the provider type of the seed/runtime cluster by
+// querying the Seed object from the garden API. Cached after first check.
+// Falls back to the shoot's provider type if the garden API is unavailable.
+func (a *actuator) getSeedProviderType(ctx context.Context, log logr.Logger, seedName string) string {
+	if seedName == "" {
+		return ""
+	}
+
+	a.mu.Lock()
+	if a.seedProviderChecked {
+		result := a.seedProviderType
+		a.mu.Unlock()
+		return result
+	}
+	a.mu.Unlock()
+
+	result := a.lookupSeedProviderType(ctx, log, seedName)
+
+	a.mu.Lock()
+	a.seedProviderChecked = true
+	a.seedProviderType = result
+	a.mu.Unlock()
+
+	return result
+}
+
+func (a *actuator) lookupSeedProviderType(ctx context.Context, log logr.Logger, seedName string) string {
+	gardenClient, err := a.getGardenClient()
+	if err != nil {
+		log.Info("Garden client unavailable, cannot determine seed provider type", "error", err)
+		return ""
+	}
+
+	seed := &gardencorev1beta1.Seed{}
+	if err := gardenClient.Get(ctx, types.NamespacedName{Name: seedName}, seed); err != nil {
+		log.Error(err, "Failed to get Seed object for provider type detection", "seedName", seedName)
+		return ""
+	}
+
+	providerType := seed.Spec.Provider.Type
+	log.Info("Detected seed provider type", "seedName", seedName, "providerType", providerType)
+	return providerType
+}
+
 // getExtensionNamespace returns the namespace where the extension controller pod
 // runs. This is where the addon ConfigMap is deployed by the Helm chart.
 func getExtensionNamespace() string {
@@ -742,12 +788,21 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 		region = "us-east-1"
 	}
 
+	// Use the seed/runtime's own provider type for seed addon rendering,
+	// not the shoot's provider type. The seed DaemonSet runs on the runtime
+	// nodes, so provider-specific values (e.g., CloudWatch vs Stackdriver)
+	// must match the runtime's cloud provider.
+	seedProvider := a.getSeedProviderType(ctx, log, seedName)
+	if seedProvider == "" {
+		seedProvider = providerType // fallback to shoot provider if garden API unavailable
+	}
+
 	meta := &shootMetadata{
 		Name:         seedName,
 		SeedName:     seedName,
 		Project:      seedName,
 		Region:       region,
-		ProviderType: providerType,
+		ProviderType: seedProvider,
 	}
 
 	// Render all seed addon charts first, then hash the rendered output.

@@ -1231,7 +1231,9 @@ func parseInfraConfig(raw []byte) (string, []string) {
 }
 
 // getCloudProviderCredentials reads the cloudprovider secret from the shoot's
-// control plane namespace.
+// control plane namespace. Supports two credential formats:
+//   - Static credentials: accessKeyID + secretAccessKey fields
+//   - Workload Identity: roleARN + token fields (STS AssumeRoleWithWebIdentity)
 func (a *actuator) getCloudProviderCredentials(ctx context.Context, namespace string) (*awsutil.Credentials, error) {
 	secret := &corev1.Secret{}
 	if err := a.client.Get(ctx, types.NamespacedName{
@@ -1243,20 +1245,28 @@ func (a *actuator) getCloudProviderCredentials(ctx context.Context, namespace st
 
 	accessKeyID := string(secret.Data["accessKeyID"])
 	secretAccessKey := string(secret.Data["secretAccessKey"])
+	roleARN := string(secret.Data["roleARN"])
+	token := string(secret.Data["token"])
 
-	if accessKeyID == "" {
-		return nil, fmt.Errorf("cloudprovider secret in %s is missing required field accessKeyID", namespace)
-	}
-	if secretAccessKey == "" {
-		return nil, fmt.Errorf("cloudprovider secret in %s is missing required field secretAccessKey", namespace)
+	// Static credentials (standard shoots)
+	if accessKeyID != "" && secretAccessKey != "" {
+		return &awsutil.Credentials{
+			AccessKeyID:    accessKeyID,
+			SecretAccessKey: secretAccessKey,
+			RoleARN:        roleARN,
+			Token:          token,
+		}, nil
 	}
 
-	return &awsutil.Credentials{
-		AccessKeyID:    accessKeyID,
-		SecretAccessKey: secretAccessKey,
-		RoleARN:        string(secret.Data["roleARN"]),
-		Token:          string(secret.Data["token"]),
-	}, nil
+	// Workload Identity credentials (managed seeds, workload identity shoots)
+	if roleARN != "" && token != "" {
+		return &awsutil.Credentials{
+			RoleARN:          roleARN,
+			WebIdentityToken: token,
+		}, nil
+	}
+
+	return nil, fmt.Errorf("cloudprovider secret in %s has no valid credentials: need accessKeyID+secretAccessKey or roleARN+token", namespace)
 }
 
 // getGCPCloudProviderCredentials reads the cloudprovider secret from the shoot's

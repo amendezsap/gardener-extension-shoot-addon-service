@@ -8,9 +8,11 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
 const (
@@ -26,11 +28,26 @@ const (
 )
 
 // Credentials holds AWS credentials extracted from the Gardener cloudprovider secret.
+// Supports two authentication modes:
+//   - Static credentials: AccessKeyID + SecretAccessKey (+ optional Token for STS)
+//   - Workload Identity: RoleARN + WebIdentityToken (STS AssumeRoleWithWebIdentity)
 type Credentials struct {
-	AccessKeyID    string
-	SecretAccessKey string
-	RoleARN        string
-	Token          string
+	AccessKeyID      string
+	SecretAccessKey  string
+	RoleARN          string
+	Token            string
+	WebIdentityToken string
+}
+
+// AuthMode returns how this credential set should authenticate.
+func (c *Credentials) AuthMode() string {
+	if c.AccessKeyID != "" {
+		return "static"
+	}
+	if c.RoleARN != "" && c.WebIdentityToken != "" {
+		return "workload-identity"
+	}
+	return "unknown"
 }
 
 // Client wraps AWS SDK clients for IAM and EC2 operations.
@@ -56,14 +73,51 @@ type EnsureResult struct {
 }
 
 // NewClient creates an AWS client from Gardener cloudprovider credentials.
+// Automatically selects the authentication method based on available fields:
+//   - Static credentials when AccessKeyID is present
+//   - STS Workload Identity when RoleARN + WebIdentityToken are present
 func NewClient(creds *Credentials, region string) (*Client, error) {
-	cfg := aws.Config{
-		Region: region,
-		Credentials: credentials.NewStaticCredentialsProvider(
-			creds.AccessKeyID,
-			creds.SecretAccessKey,
-			creds.Token, // Empty string if not using STS
-		),
+	var cfg aws.Config
+
+	switch creds.AuthMode() {
+	case "static":
+		cfg = aws.Config{
+			Region: region,
+			Credentials: credentials.NewStaticCredentialsProvider(
+				creds.AccessKeyID,
+				creds.SecretAccessKey,
+				creds.Token, // Empty string if not using STS
+			),
+		}
+
+	case "workload-identity":
+		// Create a base STS client with anonymous credentials for the
+		// AssumeRoleWithWebIdentity call (it doesn't need pre-existing creds).
+		baseCfg := aws.Config{
+			Region:      region,
+			Credentials: aws.AnonymousCredentials{},
+		}
+		stsClient := sts.NewFromConfig(baseCfg)
+
+		// Create a web identity role provider that uses the token directly.
+		// Note: the token is read once from the cloudprovider secret. If it
+		// expires during a long reconciliation, the CredentialsCache will
+		// attempt to refresh, but the underlying token is static. Gardener
+		// rotates the secret periodically and the extension pod restarts,
+		// so in practice token lifetime is not a concern.
+		provider := stscreds.NewWebIdentityRoleProvider(
+			stsClient,
+			creds.RoleARN,
+			IdentityTokenRetriever(creds.WebIdentityToken),
+		)
+
+		cfg = aws.Config{
+			Region:      region,
+			Credentials: aws.NewCredentialsCache(provider),
+		}
+
+	default:
+		return nil, fmt.Errorf("no valid AWS credentials: need either accessKeyID+secretAccessKey or roleARN+webIdentityToken")
 	}
 
 	return &Client{
@@ -71,6 +125,14 @@ func NewClient(creds *Credentials, region string) (*Client, error) {
 		ec2:    ec2.NewFromConfig(cfg),
 		region: region,
 	}, nil
+}
+
+// IdentityTokenRetriever implements stscreds.IdentityTokenRetriever for a
+// static token value (as opposed to reading from a file).
+type IdentityTokenRetriever string
+
+func (t IdentityTokenRetriever) GetIdentityToken() ([]byte, error) {
+	return []byte(t), nil
 }
 
 // --------------------------------------------------------------------------
@@ -354,13 +416,12 @@ func (c *Client) addSecurityGroupToEndpoint(ctx context.Context, endpointID, sgI
 		}
 	}
 
-	newSGs := append(currentSGs, sgID)
 	_, err := c.ec2.ModifyVpcEndpoint(ctx, &ec2.ModifyVpcEndpointInput{
 		VpcEndpointId:       aws.String(endpointID),
 		AddSecurityGroupIds: []string{sgID},
 	})
 	if err != nil {
-		return fmt.Errorf("add SG %s to endpoint %s (current: %v, desired: %v): %w", sgID, endpointID, currentSGs, newSGs, err)
+		return fmt.Errorf("add SG %s to endpoint %s (current: %v): %w", sgID, endpointID, currentSGs, err)
 	}
 	return nil
 }

@@ -47,11 +47,6 @@ jobs:
           KO_DOCKER_REPO: ghcr.io/${{ github.repository_owner }}/gardener-extension-admission-shoot-addon-service
         run: ko build --bare --tags ${{ steps.version.outputs.tag }} ./cmd/gardener-extension-admission-shoot-addon-service
 
-      - name: Build and push list-containers image
-        env:
-          KO_DOCKER_REPO: ghcr.io/${{ github.repository_owner }}/list-containers
-        run: ko build --bare --tags ${{ steps.version.outputs.tag }} ./cmd/list-containers
-
       # Helm chart
       - name: Package and push extension chart
         run: |

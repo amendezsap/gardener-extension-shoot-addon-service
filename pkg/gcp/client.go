@@ -13,8 +13,25 @@ import (
 )
 
 // Credentials holds GCP credentials extracted from the Gardener cloudprovider secret.
+// Supports two authentication modes:
+//   - Static: ServiceAccountJSON (standard shoots)
+//   - Workload Identity Federation: CredentialsConfig + Token + ProjectID (managed seeds)
 type Credentials struct {
 	ServiceAccountJSON []byte
+	CredentialsConfig  []byte
+	Token              string
+	ProjectID          string
+}
+
+// AuthMode returns how this credential set should authenticate.
+func (c *Credentials) AuthMode() string {
+	if len(c.ServiceAccountJSON) > 0 {
+		return "static"
+	}
+	if len(c.CredentialsConfig) > 0 && c.Token != "" {
+		return "workload-identity"
+	}
+	return "unknown"
 }
 
 // Client wraps GCP API clients for IAM operations.
@@ -27,41 +44,82 @@ type Client struct {
 const maxRetries = 5
 
 // NewClient creates a GCP client from Gardener cloudprovider credentials.
+// Automatically selects the authentication method based on available fields:
+//   - Static credentials when ServiceAccountJSON is present
+//   - Workload Identity Federation when CredentialsConfig + Token are present
 func NewClient(creds *Credentials) (*Client, error) {
-	if len(creds.ServiceAccountJSON) == 0 {
-		return nil, fmt.Errorf("service account JSON is empty")
-	}
-
-	// Parse project ID from service account JSON
-	var sa struct {
-		ProjectID string `json:"project_id"`
-	}
-	if err := json.Unmarshal(creds.ServiceAccountJSON, &sa); err != nil {
-		return nil, fmt.Errorf("parse service account JSON: %w", err)
-	}
-	if sa.ProjectID == "" {
-		return nil, fmt.Errorf("service account JSON missing project_id")
-	}
-
 	ctx := context.Background()
-	jwtConfig, err := google.JWTConfigFromJSON(creds.ServiceAccountJSON,
-		cloudresourcemanager.CloudPlatformScope,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("create JWT config: %w", err)
+
+	switch creds.AuthMode() {
+	case "static":
+		// Parse project ID from service account JSON
+		var sa struct {
+			ProjectID string `json:"project_id"`
+		}
+		if err := json.Unmarshal(creds.ServiceAccountJSON, &sa); err != nil {
+			return nil, fmt.Errorf("parse service account JSON: %w", err)
+		}
+		if sa.ProjectID == "" {
+			return nil, fmt.Errorf("service account JSON missing project_id")
+		}
+
+		jwtConfig, err := google.JWTConfigFromJSON(creds.ServiceAccountJSON,
+			cloudresourcemanager.CloudPlatformScope,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("create JWT config: %w", err)
+		}
+
+		crm, err := cloudresourcemanager.NewService(ctx, option.WithHTTPClient(jwtConfig.Client(ctx)))
+		if err != nil {
+			return nil, fmt.Errorf("create cloudresourcemanager client: %w", err)
+		}
+
+		return &Client{crm: crm, projectID: sa.ProjectID}, nil
+
+	case "workload-identity":
+		if creds.ProjectID == "" {
+			return nil, fmt.Errorf("workload identity credentials missing projectID")
+		}
+
+		// Build an external account credentials JSON that the Google auth
+		// library understands. The credentialsConfig contains the audience
+		// and workload identity pool. We inject the token as a file-sourced
+		// credential by writing it inline.
+		var configMap map[string]interface{}
+		if err := json.Unmarshal(creds.CredentialsConfig, &configMap); err != nil {
+			return nil, fmt.Errorf("parse credentialsConfig: %w", err)
+		}
+
+		// Override the credential source to use the token directly via
+		// executable or text format. The Google auth library supports
+		// "credential_source.text" for inline tokens.
+		configMap["credential_source"] = map[string]interface{}{
+			"text": creds.Token,
+		}
+
+		externalJSON, err := json.Marshal(configMap)
+		if err != nil {
+			return nil, fmt.Errorf("marshal external account config: %w", err)
+		}
+
+		gcpCreds, err := google.CredentialsFromJSON(ctx, externalJSON,
+			cloudresourcemanager.CloudPlatformScope,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("create credentials from external account config: %w", err)
+		}
+
+		crm, err := cloudresourcemanager.NewService(ctx, option.WithCredentials(gcpCreds))
+		if err != nil {
+			return nil, fmt.Errorf("create cloudresourcemanager client: %w", err)
+		}
+
+		return &Client{crm: crm, projectID: creds.ProjectID}, nil
+
+	default:
+		return nil, fmt.Errorf("no valid GCP credentials: need either serviceaccount.json or credentialsConfig+token+projectID")
 	}
-
-	httpClient := jwtConfig.Client(ctx)
-
-	crm, err := cloudresourcemanager.NewService(ctx, option.WithHTTPClient(httpClient))
-	if err != nil {
-		return nil, fmt.Errorf("create cloudresourcemanager client: %w", err)
-	}
-
-	return &Client{
-		crm:       crm,
-		projectID: sa.ProjectID,
-	}, nil
 }
 
 // ProjectID returns the project ID parsed from the service account credentials.

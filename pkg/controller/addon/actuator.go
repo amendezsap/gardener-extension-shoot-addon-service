@@ -1328,7 +1328,9 @@ func (a *actuator) getCloudProviderCredentials(ctx context.Context, namespace st
 }
 
 // getGCPCloudProviderCredentials reads the cloudprovider secret from the shoot's
-// control plane namespace and extracts GCP service account JSON.
+// control plane namespace. Supports two credential formats:
+//   - Static: serviceaccount.json field (standard shoots)
+//   - Workload Identity Federation: credentialsConfig + token + projectID (managed seeds)
 func (a *actuator) getGCPCloudProviderCredentials(ctx context.Context, namespace string) (*gcputil.Credentials, error) {
 	secret := &corev1.Secret{}
 	if err := a.client.Get(ctx, types.NamespacedName{
@@ -1338,14 +1340,27 @@ func (a *actuator) getGCPCloudProviderCredentials(ctx context.Context, namespace
 		return nil, fmt.Errorf("failed to get cloudprovider secret in %s: %w", namespace, err)
 	}
 
+	// Static credentials (standard shoots)
 	serviceAccountJSON := secret.Data["serviceaccount.json"]
-	if len(serviceAccountJSON) == 0 {
-		return nil, fmt.Errorf("cloudprovider secret in %s is missing required field serviceaccount.json", namespace)
+	if len(serviceAccountJSON) > 0 {
+		return &gcputil.Credentials{
+			ServiceAccountJSON: serviceAccountJSON,
+		}, nil
 	}
 
-	return &gcputil.Credentials{
-		ServiceAccountJSON: serviceAccountJSON,
-	}, nil
+	// Workload Identity Federation (managed seeds)
+	credentialsConfig := secret.Data["credentialsConfig"]
+	token := string(secret.Data["token"])
+	projectID := string(secret.Data["projectID"])
+	if len(credentialsConfig) > 0 && token != "" {
+		return &gcputil.Credentials{
+			CredentialsConfig: credentialsConfig,
+			Token:             token,
+			ProjectID:         projectID,
+		}, nil
+	}
+
+	return nil, fmt.Errorf("cloudprovider secret in %s has no valid GCP credentials: need serviceaccount.json or credentialsConfig+token", namespace)
 }
 
 // getGCPNodeServiceAccountFromInfraStatus reads the node service account email

@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install ko
+        uses: ko-build/setup-ko@v0.9
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get version
+        id: version
+        run: echo "tag=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      # Container images
+      - name: Build and push extension image
+        env:
+          KO_DOCKER_REPO: ghcr.io/${{ github.repository_owner }}/gardener-extension-shoot-addon-service
+        run: ko build --bare --tags ${{ steps.version.outputs.tag }} ./cmd/gardener-extension-shoot-addon-service
+
+      - name: Build and push admission image
+        env:
+          KO_DOCKER_REPO: ghcr.io/${{ github.repository_owner }}/gardener-extension-admission-shoot-addon-service
+        run: ko build --bare --tags ${{ steps.version.outputs.tag }} ./cmd/gardener-extension-admission-shoot-addon-service
+
+      - name: Build and push list-containers image
+        env:
+          KO_DOCKER_REPO: ghcr.io/${{ github.repository_owner }}/list-containers
+        run: ko build --bare --tags ${{ steps.version.outputs.tag }} ./cmd/list-containers
+
+      # Helm chart
+      - name: Package and push extension chart
+        run: |
+          helm package charts/gardener-extension-shoot-addon-service -d /tmp/
+          CHART_VERSION=$(grep '^version:' charts/gardener-extension-shoot-addon-service/Chart.yaml | awk '{print $2}')
+          helm push /tmp/gardener-extension-shoot-addon-service-${CHART_VERSION}.tgz oci://ghcr.io/${{ github.repository_owner }}/charts

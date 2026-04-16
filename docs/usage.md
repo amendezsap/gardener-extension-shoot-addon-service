@@ -267,6 +267,12 @@ Currently supported:
 
 Additional managed Kubernetes services (OKE, DOKS, LKE, etc.) can be added on request. Open an issue if you need detection for a service not listed above.
 
+#### Not currently detected
+
+The following are noted as possible future enhancements but **not currently supported**:
+
+- **OpenStack-based managed Kubernetes services** — services like OTC CCE, SAP Converged Cloud, or Yandex Managed Kubernetes that run on OpenStack infrastructure. Note that OpenStack itself is an IaaS, not a managed Kubernetes service — clusters provisioned by Gardener on OpenStack VMs correctly report `ProviderType=openstack` and `ManagedKubernetesProvider=""`. Detection would only apply to clusters where the cloud provider also runs the Kubernetes control plane.
+
 ### Example: Provider-aware addon configuration
 
 ```yaml

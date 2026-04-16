@@ -54,6 +54,10 @@ spec:
             - name: REGION
               value: {{ .Values.region | quote }}
             {{- end }}
+            {{- if .Values.managedKubernetesProvider }}
+            - name: MANAGED_KUBERNETES_PROVIDER
+              value: {{ .Values.managedKubernetesProvider | quote }}
+            {{- end }}
             - name: OCI_CHART_CACHE_DIR
               value: {{ .Values.ociChartCacheDir | quote }}
           ports:

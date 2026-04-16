@@ -763,7 +763,11 @@ func (a *actuator) shootIsManagedSeed(ctx context.Context, log logr.Logger, shoo
 // Returns "" if the runtime is self-managed Kubernetes (e.g., kubeadm, kops,
 // or a Gardener-provisioned shoot acting as a seed).
 //
-// Detection is based on node labels set by each managed Kubernetes service.
+// Resolution order:
+//  1. MANAGED_KUBERNETES_PROVIDER env var (operator override, always wins)
+//  2. Auto-detection via node labels (uses uncached API call to avoid
+//     poisoning the controller-runtime cache if RBAC denies node access)
+//
 // Cached after first lookup.
 func (a *actuator) getManagedKubernetesProvider(ctx context.Context, log logr.Logger) string {
 	a.mu.Lock()
@@ -774,7 +778,13 @@ func (a *actuator) getManagedKubernetesProvider(ctx context.Context, log logr.Lo
 	}
 	a.mu.Unlock()
 
-	result := a.detectManagedKubernetesProvider(ctx, log)
+	// Check for operator override first
+	result := os.Getenv("MANAGED_KUBERNETES_PROVIDER")
+	if result != "" {
+		log.Info("Using managed Kubernetes provider from env var", "provider", result)
+	} else {
+		result = a.detectManagedKubernetesProvider(ctx, log)
+	}
 
 	a.mu.Lock()
 	a.managedKubernetesChecked = true
@@ -785,9 +795,21 @@ func (a *actuator) getManagedKubernetesProvider(ctx context.Context, log logr.Lo
 }
 
 func (a *actuator) detectManagedKubernetesProvider(ctx context.Context, log logr.Logger) string {
+	// Use a direct (uncached) API client to list nodes. The controller-runtime
+	// cached client (a.client) sets up a watch reflector for every resource type
+	// it touches. If the extension's ServiceAccount lacks nodes RBAC, the
+	// reflector enters an infinite retry loop that floods logs and wastes
+	// resources. A direct client avoids this — if the call fails, nothing is
+	// left behind.
+	directClient, err := client.New(a.restConfig, client.Options{})
+	if err != nil {
+		log.Info("Failed to create direct client for node detection", "error", err)
+		return ""
+	}
+
 	nodeList := &corev1.NodeList{}
-	if err := a.client.List(ctx, nodeList, &client.ListOptions{Limit: 1}); err != nil {
-		log.Info("Failed to list nodes for managed Kubernetes detection", "error", err)
+	if err := directClient.List(ctx, nodeList, &client.ListOptions{Limit: 1}); err != nil {
+		log.Info("Cannot detect managed Kubernetes provider (nodes not accessible, set MANAGED_KUBERNETES_PROVIDER env var to override)", "error", err)
 		return ""
 	}
 	if len(nodeList.Items) == 0 {

@@ -50,12 +50,14 @@ type actuator struct {
 	client             client.Client
 	restConfig         *rest.Config
 	chartPuller        *oci.ChartPuller
-	seedAddonsHash      string
-	managedSeedChecked  bool
-	managedSeedResult   bool
-	seedProviderType    string
-	seedProviderChecked bool
-	mu                  sync.Mutex
+	seedAddonsHash             string
+	managedSeedChecked         bool
+	managedSeedResult          bool
+	seedProviderType           string
+	seedProviderChecked        bool
+	managedKubernetesProvider  string
+	managedKubernetesChecked   bool
+	mu                         sync.Mutex
 }
 
 // NewActuator creates a new actuator.
@@ -80,19 +82,21 @@ func NewActuator(mgr manager.Manager) *actuator {
 
 // shootMetadata holds extracted shoot info needed for reconciliation.
 type shootMetadata struct {
-	Name                  string
-	Namespace             string
-	Project               string
-	ControlNamespace      string
-	Region                string
-	ProviderType          string
-	VpcID                 string
-	WorkerCIDRs           []string
-	NodeRoleName          string
-	NodeSecurityGroup     string // from Infrastructure status (AWS)
-	Partition             string
-	SeedName              string
-	GCPNodeServiceAccount string // from Infrastructure status (GCP)
+	Name                      string
+	Namespace                 string
+	Project                   string
+	ControlNamespace          string
+	Region                    string
+	ProviderType              string
+	VpcID                     string
+	WorkerCIDRs               []string
+	NodeRoleName              string
+	NodeSecurityGroup         string // from Infrastructure status (AWS)
+	Partition                 string
+	SeedName                  string
+	GCPNodeServiceAccount     string // from Infrastructure status (GCP)
+	ClusterRole               string // "runtime", "managed-seed", or "shoot"
+	ManagedKubernetesProvider string // "GKE", "EKS", "AKS", or "" for self-managed
 }
 
 // Reconcile creates/updates IAM policies, VPC endpoints, and deploys addon
@@ -103,7 +107,7 @@ func (a *actuator) Reconcile(ctx context.Context, log logr.Logger, ex *extension
 		return fmt.Errorf("failed to get cluster: %w", err)
 	}
 
-	meta, err := a.extractShootMetadata(cluster, ex.Namespace)
+	meta, err := a.extractShootMetadata(ctx, log, cluster, ex.Namespace)
 	if err != nil {
 		return fmt.Errorf("failed to extract shoot metadata: %w", err)
 	}
@@ -402,7 +406,7 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 		return fmt.Errorf("failed to get cluster: %w", err)
 	}
 
-	meta, err := a.extractShootMetadata(cluster, ex.Namespace)
+	meta, err := a.extractShootMetadata(ctx, log, cluster, ex.Namespace)
 	if err != nil {
 		return fmt.Errorf("failed to extract shoot metadata: %w", err)
 	}
@@ -737,6 +741,92 @@ func (a *actuator) lookupSeedProviderType(ctx context.Context, log logr.Logger, 
 	return providerType
 }
 
+// shootIsManagedSeed checks if a shoot is also a managed seed (a Seed object
+// exists with the same name in the garden cluster). Returns false if the
+// garden API is unavailable.
+func (a *actuator) shootIsManagedSeed(ctx context.Context, log logr.Logger, shootName string) bool {
+	gardenClient, err := a.getGardenClient()
+	if err != nil {
+		return false
+	}
+
+	seed := &gardencorev1beta1.Seed{}
+	if err := gardenClient.Get(ctx, types.NamespacedName{Name: shootName}, seed); err != nil {
+		// Not found means this shoot is not a managed seed, which is the common case.
+		return false
+	}
+	return true
+}
+
+// getManagedKubernetesProvider returns the cloud-provider-managed Kubernetes
+// distribution running on the runtime cluster (e.g., "GKE", "EKS", "AKS").
+// Returns "" if the runtime is self-managed Kubernetes (e.g., kubeadm, kops,
+// or a Gardener-provisioned shoot acting as a seed).
+//
+// Detection is based on node labels set by each managed Kubernetes service.
+// Cached after first lookup.
+func (a *actuator) getManagedKubernetesProvider(ctx context.Context, log logr.Logger) string {
+	a.mu.Lock()
+	if a.managedKubernetesChecked {
+		result := a.managedKubernetesProvider
+		a.mu.Unlock()
+		return result
+	}
+	a.mu.Unlock()
+
+	result := a.detectManagedKubernetesProvider(ctx, log)
+
+	a.mu.Lock()
+	a.managedKubernetesChecked = true
+	a.managedKubernetesProvider = result
+	a.mu.Unlock()
+
+	return result
+}
+
+func (a *actuator) detectManagedKubernetesProvider(ctx context.Context, log logr.Logger) string {
+	nodeList := &corev1.NodeList{}
+	if err := a.client.List(ctx, nodeList, &client.ListOptions{Limit: 1}); err != nil {
+		log.Info("Failed to list nodes for managed Kubernetes detection", "error", err)
+		return ""
+	}
+	if len(nodeList.Items) == 0 {
+		return ""
+	}
+
+	// Detection is keyed on node labels set by each managed Kubernetes service.
+	// Add cases here when new services need to be supported — see docs/usage.md
+	// for the list of currently detected providers.
+	labels := nodeList.Items[0].Labels
+	switch {
+	case hasLabelPrefix(labels, "cloud.google.com/gke-"):
+		return "GKE"
+	case hasLabelPrefix(labels, "eks.amazonaws.com/"):
+		return "EKS"
+	case hasLabelPrefix(labels, "kubernetes.azure.com/"):
+		return "AKS"
+	case hasLabel(labels, "node.openshift.io/os_id"):
+		return "OpenShift"
+	}
+	return ""
+}
+
+// hasLabel returns true if the labels map has the given key.
+func hasLabel(labels map[string]string, key string) bool {
+	_, ok := labels[key]
+	return ok
+}
+
+// hasLabelPrefix returns true if any label key starts with the given prefix.
+func hasLabelPrefix(labels map[string]string, prefix string) bool {
+	for k := range labels {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // getExtensionNamespace returns the namespace where the extension controller pod
 // runs. This is where the addon ConfigMap is deployed by the Helm chart.
 func getExtensionNamespace() string {
@@ -797,12 +887,22 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 		seedProvider = providerType // fallback to shoot provider if garden API unavailable
 	}
 
+	// Detect if the runtime is a cloud-provider-managed Kubernetes service
+	// (GKE, EKS, AKS) for use in addon templates that need to differentiate
+	// cluster types. Empty if self-managed Kubernetes.
+	managedK8s := a.getManagedKubernetesProvider(ctx, log)
+
+	// Seed addons only run on raw runtime clusters — managed seeds are skipped
+	// earlier in this function via isManagedSeed. So ClusterRole is always
+	// "runtime" at this point.
 	meta := &shootMetadata{
-		Name:         seedName,
-		SeedName:     seedName,
-		Project:      seedName,
-		Region:       region,
-		ProviderType: seedProvider,
+		Name:                      seedName,
+		SeedName:                  seedName,
+		Project:                   seedName,
+		Region:                    region,
+		ProviderType:              seedProvider,
+		ClusterRole:               "runtime",
+		ManagedKubernetesProvider: managedK8s,
 	}
 
 	// Render all seed addon charts first, then hash the rendered output.
@@ -1157,7 +1257,7 @@ func getMissingNamespaces(configYAML string, required []string) []string {
 // --------------------------------------------------------------------------
 
 // extractShootMetadata pulls relevant shoot info from the Cluster resource.
-func (a *actuator) extractShootMetadata(cluster *extensionscontroller.Cluster, namespace string) (*shootMetadata, error) {
+func (a *actuator) extractShootMetadata(ctx context.Context, log logr.Logger, cluster *extensionscontroller.Cluster, namespace string) (*shootMetadata, error) {
 	shoot := cluster.Shoot
 	if shoot == nil {
 		return nil, fmt.Errorf("cluster has no shoot")
@@ -1193,20 +1293,29 @@ func (a *actuator) extractShootMetadata(cluster *extensionscontroller.Cluster, n
 		seedName = *shoot.Spec.SeedName
 	}
 
+	// Detect if this shoot is also a managed seed (a Seed object exists with
+	// the same name). Used by addon templates to differentiate cluster role.
+	clusterRole := "shoot"
+	if a.shootIsManagedSeed(ctx, log, shoot.Name) {
+		clusterRole = "managed-seed"
+	}
+
 	return &shootMetadata{
-		Name:                  shoot.Name,
-		Namespace:             shoot.Namespace,
-		Project:               project,
-		ControlNamespace:      namespace,
-		Region:                region,
-		ProviderType:          shoot.Spec.Provider.Type,
-		VpcID:                 vpcID,
-		WorkerCIDRs:           workerCIDRs,
-		NodeRoleName:          fmt.Sprintf("%s-nodes", namespace),
-		NodeSecurityGroup:     nodeSG,
-		Partition:             partition,
-		SeedName:              seedName,
-		GCPNodeServiceAccount: gcpNodeSA,
+		Name:                      shoot.Name,
+		Namespace:                 shoot.Namespace,
+		Project:                   project,
+		ControlNamespace:          namespace,
+		Region:                    region,
+		ProviderType:              shoot.Spec.Provider.Type,
+		VpcID:                     vpcID,
+		WorkerCIDRs:               workerCIDRs,
+		NodeRoleName:              fmt.Sprintf("%s-nodes", namespace),
+		NodeSecurityGroup:         nodeSG,
+		Partition:                 partition,
+		SeedName:                  seedName,
+		GCPNodeServiceAccount:     gcpNodeSA,
+		ClusterRole:               clusterRole,
+		ManagedKubernetesProvider: "", // shoots are vanilla Kubernetes
 	}, nil
 }
 
@@ -1645,6 +1754,9 @@ func expandValue(v interface{}, meta *shootMetadata) interface{} {
 		s = strings.ReplaceAll(s, "{{ .ShootNamespace }}", meta.Namespace)
 		s = strings.ReplaceAll(s, "{{ .Project }}", meta.Project)
 		s = strings.ReplaceAll(s, "{{ .ControlNamespace }}", meta.ControlNamespace)
+		s = strings.ReplaceAll(s, "{{ .ProviderType }}", meta.ProviderType)
+		s = strings.ReplaceAll(s, "{{ .ClusterRole }}", meta.ClusterRole)
+		s = strings.ReplaceAll(s, "{{ .ManagedKubernetesProvider }}", meta.ManagedKubernetesProvider)
 		return s
 	case map[string]interface{}:
 		result := make(map[string]interface{}, len(val))

@@ -291,6 +291,24 @@ For each addon, values are merged in order (last wins):
 4. `shootValues` from the addon manifest
 5. Image overrides from environment variables
 
+### Template Variables
+
+`shootValues` supports template variable expansion. Available variables:
+
+| Variable | Description |
+|---|---|
+| `{{ .Region }}` | Cloud provider region |
+| `{{ .SeedName }}` | Name of the seed |
+| `{{ .ShootName }}` | Shoot name |
+| `{{ .ShootNamespace }}` | Shoot namespace in garden cluster |
+| `{{ .Project }}` | Gardener project name |
+| `{{ .ControlNamespace }}` | Shoot control plane namespace on seed |
+| `{{ .ProviderType }}` | Cloud provider type (`aws`, `gcp`, `azure`, ...) |
+| `{{ .ClusterRole }}` | Cluster role: `runtime`, `managed-seed`, or `shoot` |
+| `{{ .ManagedKubernetesProvider }}` | Cloud-managed Kubernetes service: `GKE`, `EKS`, `AKS`, `OpenShift`, or empty |
+
+`ClusterRole` and `ManagedKubernetesProvider` enable addons to differentiate between Gardener cluster types (runtime vs managed-seed vs shoot) and detect cloud-managed Kubernetes services. See [docs/usage.md](docs/usage.md#template-variables) for details and examples.
+
 ## Prerequisites
 
 - Go 1.24+

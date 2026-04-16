@@ -228,12 +228,65 @@ The `shootValues` field supports template variable expansion:
 
 | Variable | Description | Example Value |
 |---|---|---|
-| `{{ .Region }}` | Shoot's cloud provider region | `eu-west-1` |
+| `{{ .Region }}` | Cloud provider region | `eu-west-1` |
 | `{{ .SeedName }}` | Name of the seed managing the shoot | `my-seed` |
 | `{{ .ShootName }}` | Shoot name | `my-shoot` |
 | `{{ .ShootNamespace }}` | Shoot namespace in garden cluster | `garden-my-project` |
 | `{{ .Project }}` | Gardener project name | `my-project` |
 | `{{ .ControlNamespace }}` | Shoot control plane namespace on seed | `shoot--my-project--my-shoot` |
+| `{{ .ProviderType }}` | Cloud provider type (hyperscaler) | `aws`, `gcp`, `azure`, `openstack` |
+| `{{ .ClusterRole }}` | Cluster role in the Gardener hierarchy | `runtime`, `managed-seed`, `shoot` |
+| `{{ .ManagedKubernetesProvider }}` | Cloud-managed K8s distribution on the runtime | `GKE`, `EKS`, `AKS`, or empty |
+
+### `{{ .ClusterRole }}` Values
+
+Differentiates the three cluster roles in the Gardener hierarchy:
+
+- `runtime` — the Gardener runtime cluster (where `gardener-operator` runs)
+- `managed-seed` — a Gardener shoot promoted to a seed via `ManagedSeed`
+- `shoot` — a regular workload shoot
+
+### `{{ .ProviderType }}` Values
+
+The cloud provider (hyperscaler) the cluster runs on. Sourced from:
+- For shoots: `Shoot.Spec.Provider.Type`
+- For runtime: `Seed.Spec.Provider.Type` of the seed registered for the runtime
+
+Common values: `aws`, `gcp`, `azure`, `openstack`, `alicloud`. May be empty if the runtime cluster is operator-only and not registered as a seed (rare — write defensive templates if 100% reliability is required).
+
+### `{{ .ManagedKubernetesProvider }}` Values
+
+Set only when `ClusterRole=runtime` and the runtime is a cloud-provider-managed Kubernetes service. Detected via node labels.
+
+Currently supported:
+- `GKE` — Google Kubernetes Engine (label prefix `cloud.google.com/gke-`)
+- `EKS` — Amazon Elastic Kubernetes Service (label prefix `eks.amazonaws.com/`)
+- `AKS` — Azure Kubernetes Service (label prefix `kubernetes.azure.com/`)
+- `OpenShift` — Red Hat OpenShift (label `node.openshift.io/os_id`)
+- Empty — self-managed Kubernetes (including Gardener-provisioned shoots acting as seeds)
+
+Additional managed Kubernetes services (OKE, DOKS, LKE, etc.) can be added on request. Open an issue if you need detection for a service not listed above.
+
+### Example: Provider-aware addon configuration
+
+```yaml
+shootValues:
+  myAddon:
+    # Tell the addon what kind of cluster it's installed on
+    clusterFlavor: |-
+      {{- if eq .ClusterRole "runtime" }}{{ .ManagedKubernetesProvider }}{{- else }}Kubernetes{{- end }}
+    # Pick a provider-specific backend
+    cloudProvider: "{{ .ProviderType }}"
+```
+
+Evaluates to:
+
+| Cluster | `clusterFlavor` | `cloudProvider` |
+|---|---|---|
+| GKE runtime | `GKE` | `gcp` |
+| EKS runtime | `EKS` | `aws` |
+| Managed seed (any cloud) | `Kubernetes` | `aws` / `gcp` / etc. |
+| Regular shoot | `Kubernetes` | `aws` / `gcp` / etc. |
 
 ## Per-Shoot Configuration
 

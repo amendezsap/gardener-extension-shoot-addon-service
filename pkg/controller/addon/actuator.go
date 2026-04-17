@@ -406,18 +406,23 @@ metadata:
 
 	// Clean up legacy ManagedResource names from previous versions.
 	//
-	// Addon MRs: normal delete (let GRM remove resources). The new MR recreates
-	// them on the next reconcile. This avoids leaving DaemonSets with stale
-	// immutable label selectors from previous versions.
+	// Per-addon keepObjectsOnRename controls the cleanup strategy:
+	//   true  → keepObjects=true (resources preserved, new MR adopts them)
+	//           Use for CronJobs, Deployments — no immutable fields.
+	//   false → normal delete (GRM removes resources, new MR recreates)
+	//           Use for DaemonSets — immutable spec.selector may have changed.
 	//
-	// Namespace MR: keepObjects=true since the namespace and all its contents
-	// must survive the rename.
+	// Namespace MR always uses keepObjects=true (namespace must survive).
 	for i := range manifest.Addons {
 		addon := &manifest.Addons[i]
 		currentName := addon.GetManagedResourceName()
 		for _, oldName := range oldShootMRNames(addon.Name) {
 			if oldName != currentName {
-				a.deleteOldManagedResource(ctx, log, ex.Namespace, oldName)
+				if addon.KeepObjectsOnRename {
+					a.cleanupRenamedManagedResource(ctx, log, ex.Namespace, oldName, currentName)
+				} else {
+					a.deleteOldManagedResource(ctx, log, ex.Namespace, oldName)
+				}
 			}
 		}
 	}

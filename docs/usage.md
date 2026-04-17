@@ -224,7 +224,9 @@ env ADDON_FLUENT_BIT_IMAGE_REPOSITORY -> image override
 
 ## Template Variables
 
-The `shootValues` field supports template variable expansion:
+The `shootValues` field supports full [Go template](https://pkg.go.dev/text/template) syntax with [Sprig](https://masterminds.github.io/sprig/) string functions. This includes conditionals, pipelines, and string manipulation.
+
+Available variables:
 
 | Variable | Description | Example Value |
 |---|---|---|
@@ -293,6 +295,30 @@ Evaluates to:
 | EKS runtime | `EKS` | `aws` |
 | Managed seed (any cloud) | `Kubernetes` | `aws` / `gcp` / etc. |
 | Regular shoot | `Kubernetes` | `aws` / `gcp` / etc. |
+
+### Sprig String Functions
+
+All [Sprig](https://masterminds.github.io/sprig/) text functions are available except security-sensitive ones (`env`, `expandenv`, crypto generators). Commonly useful:
+
+```yaml
+shootValues:
+  myAddon:
+    # String manipulation
+    upperProvider: "{{ .ProviderType | upper }}"            # AWS
+    shortRole: "{{ trimPrefix "managed-" .ClusterRole }}"   # seed
+    # Defaults for empty values
+    k8sService: "{{ .ManagedKubernetesProvider | default "Kubernetes" }}"
+    # String testing
+    isSeed: "{{- if contains "seed" .ClusterRole }}true{{- else }}false{{- end }}"
+```
+
+### Security
+
+Template execution is sandboxed:
+- **Blocked functions**: `env`, `expandenv`, `genPrivateKey`, `genCA`, and other crypto/secret functions are removed
+- **Timeout**: Templates must complete within 5 seconds
+- **Output size limit**: Rendered output capped at 1MB
+- **Passthrough on error**: If a template fails to parse or execute, the original string is returned unchanged
 
 ## Per-Shoot Configuration
 

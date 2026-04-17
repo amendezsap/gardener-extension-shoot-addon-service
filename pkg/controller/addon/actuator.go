@@ -13,6 +13,10 @@ import (
 	"sync"
 	"time"
 
+	"bytes"
+	"text/template"
+
+	"github.com/Masterminds/sprig/v3"
 	"github.com/go-logr/logr"
 	"gopkg.in/yaml.v3"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
@@ -29,6 +33,7 @@ import (
 	extensionscontroller "github.com/gardener/gardener/extensions/pkg/controller"
 	gardencorev1beta1 "github.com/gardener/gardener/pkg/apis/core/v1beta1"
 	extensionsv1alpha1 "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
+	resourcesv1alpha1 "github.com/gardener/gardener/pkg/apis/resources/v1alpha1"
 	"github.com/gardener/gardener/pkg/chartrenderer"
 	"github.com/gardener/gardener/pkg/utils/managedresources"
 
@@ -362,9 +367,12 @@ metadata:
 		currentName := addon.GetManagedResourceName()
 		for _, oldName := range []string{"addon-" + addon.Name, "managed-resources-" + addon.Name} {
 			if oldName != currentName {
-				if err := managedresources.DeleteForShoot(ctx, a.client, ex.Namespace, oldName); err == nil {
-					log.Info("Deleted old ManagedResource", "old", oldName, "new", currentName)
-				}
+				// Force-delete old MRs by removing the finalizer first. The new MR
+				// already owns the same underlying resources (SA, CronJob, etc.), so
+				// letting the GRM try to clean up the old MR's resources causes it to
+				// get stuck in DeletionPending forever (can't delete resources still
+				// referenced by the new MR).
+				a.forceDeleteManagedResource(ctx, log, ex.Namespace, oldName, currentName)
 			}
 		}
 	}
@@ -1539,6 +1547,37 @@ func (a *actuator) deleteManagedResource(ctx context.Context, namespace, name st
 	return managedresources.WaitUntilDeleted(ctx, a.client, namespace, name)
 }
 
+// forceDeleteManagedResource removes a stale ManagedResource by stripping its
+// finalizer before deletion. This prevents the GRM from trying to delete
+// underlying resources that are now owned by a replacement ManagedResource.
+//
+// Use this only for MR renames where the new MR manages the same resources.
+// For normal deletions (extension removal), use deleteManagedResource instead.
+func (a *actuator) forceDeleteManagedResource(ctx context.Context, log logr.Logger, namespace, oldName, newName string) {
+	mr := &resourcesv1alpha1.ManagedResource{}
+	key := types.NamespacedName{Name: oldName, Namespace: namespace}
+	if err := a.client.Get(ctx, key, mr); err != nil {
+		return // not found — already cleaned up
+	}
+
+	// Remove finalizer so the GRM doesn't try to clean up resources
+	if len(mr.Finalizers) > 0 {
+		mr.Finalizers = nil
+		if err := a.client.Update(ctx, mr); err != nil {
+			log.Error(err, "Failed to remove finalizer from old ManagedResource", "old", oldName)
+			return
+		}
+	}
+
+	// Delete the MR object itself
+	if err := a.client.Delete(ctx, mr); err != nil {
+		log.Error(err, "Failed to delete old ManagedResource", "old", oldName)
+		return
+	}
+
+	log.Info("Force-deleted old ManagedResource (replaced by new)", "old", oldName, "new", newName)
+}
+
 // --------------------------------------------------------------------------
 // Registry secrets
 // --------------------------------------------------------------------------
@@ -1750,51 +1789,143 @@ func isNotExist(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "file does not exist")
 }
 
-// expandShootValues processes a ShootValues map, replacing template variables
-// with shoot-specific values.
+// maxTemplateOutputBytes is the maximum rendered template size (1MB).
+// Prevents memory exhaustion from malicious templates like {{ repeat 999999 "x" }}.
+const maxTemplateOutputBytes = 1 << 20
+
+// templateTimeout is the maximum time allowed for template execution.
+const templateTimeout = 5 * time.Second
+
+// safeFuncMap returns Sprig's text function map with dangerous functions removed.
+// Removed functions that could leak secrets or perform unnecessary crypto operations.
+func safeFuncMap() template.FuncMap {
+	funcMap := sprig.TxtFuncMap()
+	// Remove functions that could leak environment variables or secrets
+	delete(funcMap, "env")
+	delete(funcMap, "expandenv")
+	// Remove crypto functions (unnecessary for values rendering)
+	delete(funcMap, "genPrivateKey")
+	delete(funcMap, "genCA")
+	delete(funcMap, "genSelfSignedCert")
+	delete(funcMap, "genSignedCert")
+	delete(funcMap, "derivePassword")
+	delete(funcMap, "buildCustomCert")
+	delete(funcMap, "encryptAES")
+	delete(funcMap, "decryptAES")
+	return funcMap
+}
+
+// templateData is the struct exposed to Go templates. Field names match the
+// template variables documented in docs/usage.md.
+type templateData struct {
+	Region                    string
+	SeedName                  string
+	ShootName                 string
+	ShootNamespace            string
+	Project                   string
+	ControlNamespace          string
+	ProviderType              string
+	ClusterRole               string
+	ManagedKubernetesProvider string
+}
+
+func newTemplateData(meta *shootMetadata) *templateData {
+	return &templateData{
+		Region:                    meta.Region,
+		SeedName:                  meta.SeedName,
+		ShootName:                 meta.Name,
+		ShootNamespace:            meta.Namespace,
+		Project:                   meta.Project,
+		ControlNamespace:          meta.ControlNamespace,
+		ProviderType:              meta.ProviderType,
+		ClusterRole:               meta.ClusterRole,
+		ManagedKubernetesProvider: meta.ManagedKubernetesProvider,
+	}
+}
+
+// expandShootValues processes a ShootValues map, expanding Go template expressions
+// with shoot-specific values. Supports full Go template syntax including
+// conditionals, Sprig string functions, and pipelines.
 //
-// Supported variables:
+// Example template expressions:
 //
-//	{{ .Region }}   -> shootMetadata.Region
-//	{{ .SeedName }} -> shootMetadata.SeedName
+//	{{ .Region }}                                          simple variable
+//	{{- if eq .ClusterRole "runtime" }}GKE{{- else }}K8s{{- end }}  conditional
+//	{{ .ClusterRole | replace "managed-" "" }}             Sprig function
+//
+// If a string does not contain template syntax ({{ }}), it is returned unchanged
+// (fast path, no template parsing overhead).
 func expandShootValues(vals map[string]interface{}, meta *shootMetadata) map[string]interface{} {
+	data := newTemplateData(meta)
 	result := make(map[string]interface{}, len(vals))
 	for k, v := range vals {
-		result[k] = expandValue(v, meta)
+		result[k] = expandValue(v, data)
 	}
 	return result
 }
 
-// expandValue recursively expands template variables in a single value.
-func expandValue(v interface{}, meta *shootMetadata) interface{} {
+// expandValue recursively expands Go template expressions in a single value.
+// Returns the original value unchanged if template parsing or execution fails
+// (passthrough on error — never breaks the reconcile).
+func expandValue(v interface{}, data *templateData) interface{} {
 	switch val := v.(type) {
 	case string:
-		s := val
-		s = strings.ReplaceAll(s, "{{ .Region }}", meta.Region)
-		s = strings.ReplaceAll(s, "{{ .SeedName }}", meta.SeedName)
-		s = strings.ReplaceAll(s, "{{ .ShootName }}", meta.Name)
-		s = strings.ReplaceAll(s, "{{ .ShootNamespace }}", meta.Namespace)
-		s = strings.ReplaceAll(s, "{{ .Project }}", meta.Project)
-		s = strings.ReplaceAll(s, "{{ .ControlNamespace }}", meta.ControlNamespace)
-		s = strings.ReplaceAll(s, "{{ .ProviderType }}", meta.ProviderType)
-		s = strings.ReplaceAll(s, "{{ .ClusterRole }}", meta.ClusterRole)
-		s = strings.ReplaceAll(s, "{{ .ManagedKubernetesProvider }}", meta.ManagedKubernetesProvider)
-		return s
+		// Fast path: skip template parsing if no template syntax present
+		if !strings.Contains(val, "{{") {
+			return val
+		}
+		return executeTemplate(val, data)
 	case map[string]interface{}:
 		result := make(map[string]interface{}, len(val))
 		for mk, mv := range val {
-			result[mk] = expandValue(mv, meta)
+			result[mk] = expandValue(mv, data)
 		}
 		return result
 	case []interface{}:
 		result := make([]interface{}, len(val))
 		for i, item := range val {
-			result[i] = expandValue(item, meta)
+			result[i] = expandValue(item, data)
 		}
 		return result
 	default:
 		return v
 	}
+}
+
+// executeTemplate parses and executes a Go template string with Sprig functions.
+// Returns the original string if parsing or execution fails (passthrough on error).
+// Enforces a timeout and output size limit as safety measures.
+func executeTemplate(s string, data *templateData) string {
+	tmpl, err := template.New("").Funcs(safeFuncMap()).Parse(s)
+	if err != nil {
+		return s // passthrough: not a valid template, treat as literal
+	}
+
+	// Execute with timeout to prevent infinite loops
+	ctx, cancel := context.WithTimeout(context.Background(), templateTimeout)
+	defer cancel()
+
+	var buf bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- tmpl.Execute(&buf, data)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return s // passthrough: execution failed
+		}
+	case <-ctx.Done():
+		return s // passthrough: timeout
+	}
+
+	// Enforce output size limit
+	if buf.Len() > maxTemplateOutputBytes {
+		return s // passthrough: output too large
+	}
+
+	return buf.String()
 }
 
 // applyImageOverride reads ADDON_<UPPER_NAME>_IMAGE_REPOSITORY and

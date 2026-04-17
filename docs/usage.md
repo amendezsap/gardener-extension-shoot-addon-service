@@ -114,7 +114,7 @@ addons:
 | `image` | No | Image override configuration |
 | `imagePullSecrets` | No | List of pull secret names to inject |
 | `namespace` | No | Override target namespace (defaults to `defaultNamespace`) |
-| `keepObjectsOnRename` | No | Preserve resources when cleaning up legacy MR names (default: `false`). Set `true` for addons with only CronJobs or Deployments. Keep `false` for addons with DaemonSets (immutable label selectors). |
+| `keepObjectsOnRename` | No | Reserved for future use. Legacy MR cleanup always preserves resources (`keepObjects=true`). |
 
 *Exactly one chart source must be specified.
 

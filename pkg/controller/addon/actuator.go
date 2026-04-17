@@ -405,24 +405,19 @@ metadata:
 	}
 
 	// Clean up legacy ManagedResource names from previous versions.
+	// All MRs use keepObjects=true — resources are preserved for the new MR to
+	// adopt. This avoids a race condition where the GRM deletes resources from
+	// the old MR while the new MR is trying to manage them.
 	//
-	// Per-addon keepObjectsOnRename controls the cleanup strategy:
-	//   true  → keepObjects=true (resources preserved, new MR adopts them)
-	//           Use for CronJobs, Deployments — no immutable fields.
-	//   false → normal delete (GRM removes resources, new MR recreates)
-	//           Use for DaemonSets — immutable spec.selector may have changed.
-	//
-	// Namespace MR always uses keepObjects=true (namespace must survive).
+	// The Helm release name is stable (addon.Name), so DaemonSet label selectors
+	// are always consistent between old and new MRs. keepObjects=true is safe
+	// for all resource types.
 	for i := range manifest.Addons {
 		addon := &manifest.Addons[i]
 		currentName := addon.GetManagedResourceName()
 		for _, oldName := range oldShootMRNames(addon.Name) {
 			if oldName != currentName {
-				if addon.KeepObjectsOnRename {
-					a.cleanupRenamedManagedResource(ctx, log, ex.Namespace, oldName, currentName)
-				} else {
-					a.deleteOldManagedResource(ctx, log, ex.Namespace, oldName)
-				}
+				a.cleanupRenamedManagedResource(ctx, log, ex.Namespace, oldName, currentName)
 			}
 		}
 	}
@@ -1611,16 +1606,6 @@ func (a *actuator) deleteManagedResource(ctx context.Context, namespace, name st
 		return err
 	}
 	return managedresources.WaitUntilDeleted(ctx, a.client, namespace, name)
-}
-
-// deleteOldManagedResource deletes a legacy addon ManagedResource and lets the
-// GRM clean up its underlying resources. The new MR recreates them on the next
-// reconcile. This is used for addon MRs where resources may have immutable
-// fields (like DaemonSet spec.selector) that changed between versions.
-func (a *actuator) deleteOldManagedResource(ctx context.Context, log logr.Logger, namespace, oldName string) {
-	if err := managedresources.DeleteForShoot(ctx, a.client, namespace, oldName); err == nil {
-		log.Info("Deleted legacy addon ManagedResource", "managedResource", oldName)
-	}
 }
 
 // cleanupRenamedManagedResource deletes a legacy ManagedResource that has been

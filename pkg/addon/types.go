@@ -162,13 +162,28 @@ func (a *Addon) GetNamespace(defaultNS string) string {
 	return defaultNS
 }
 
-// GetManagedResourceName returns the explicit managed resource name if set,
-// otherwise returns "addon-<name>".
+// ManagedResourcePrefix is the standard prefix for ManagedResources created by
+// this extension, following the Gardener convention of extension-<type>-<name>.
+const ManagedResourcePrefix = "extension-shoot-addon-service-"
+
+// GetManagedResourceName returns the ManagedResource name following Gardener
+// convention: extension-shoot-addon-service-<addon-name>.
+//
+// If ManagedResourceName is set explicitly, it is used as the suffix instead
+// of the addon name. This is for backward compatibility; new addons should
+// rely on the automatic naming.
 func (a *Addon) GetManagedResourceName() string {
+	suffix := a.Name
 	if a.ManagedResourceName != "" {
-		return a.ManagedResourceName
+		suffix = a.ManagedResourceName
 	}
-	return "addon-" + a.Name
+	return ManagedResourcePrefix + suffix
+}
+
+// GetSeedManagedResourceName returns the seed-class ManagedResource name:
+// extension-shoot-addon-service-<addon-name>-seed.
+func (a *Addon) GetSeedManagedResourceName() string {
+	return a.GetManagedResourceName() + "-seed"
 }
 
 // Validate checks that the addon definition is well-formed:

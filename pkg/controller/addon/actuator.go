@@ -2021,7 +2021,8 @@ func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon 
 	// the hook-aware renderer which includes hook-annotated templates and
 	// captures delete hooks separately.
 	if addon.Hooks != nil && addon.Hooks.Include {
-		return a.renderAddonChartWithHooks(ctx, log, addon, releaseName, ns, meta.ControlNamespace, merged)
+		isSeedRender := meta.ClusterRole == "runtime"
+		return a.renderAddonChartWithHooks(ctx, log, addon, releaseName, ns, meta.ControlNamespace, isSeedRender, merged)
 	}
 
 	// Standard rendering path: Gardener chartrenderer (hooks silently dropped)
@@ -2057,7 +2058,7 @@ func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon 
 // renderAddonChartWithHooks uses the hook-aware renderer to include Helm
 // hook-annotated templates. Delete hooks are stored in a separate secret
 // for execution during addon removal.
-func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logger, addon *addonpkg.Addon, releaseName, namespace, controlPlaneNamespace string, values map[string]interface{}) (map[string][]byte, error) {
+func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logger, addon *addonpkg.Addon, releaseName, namespace, controlPlaneNamespace string, isSeedRender bool, values map[string]interface{}) (map[string][]byte, error) {
 	disc, err := discovery.NewDiscoveryClientForConfig(a.restConfig)
 	if err != nil {
 		return nil, fmt.Errorf("create discovery client: %w", err)
@@ -2108,10 +2109,20 @@ func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logge
 		a.persistDeleteHooks(ctx, log, controlPlaneNamespace, addon.Name, result.PreDeleteHooks, result.PostDeleteHooks)
 	}
 
-	// Apply one-time Jobs directly (not via MR). These Jobs should run once
-	// and stay completed. Skip if the Job already exists and has succeeded.
+	// One-time Jobs handling depends on render context:
+	// - Seed renders: apply directly to the runtime cluster (we have access)
+	// - Shoot renders: include in MR data (GRM applies to the shoot cluster)
 	if len(result.OneTimeJobs) > 0 {
-		a.applyOneTimeJobs(context.Background(), log, a.restConfig, namespace, addon.Name, result.OneTimeJobs)
+		if isSeedRender {
+			// Direct application on the runtime — skip if Job already exists
+			a.applyOneTimeJobs(ctx, log, a.restConfig, namespace, addon.Name, result.OneTimeJobs)
+		} else {
+			// Include in MR data for shoot deployment via GRM
+			for i, jobYAML := range result.OneTimeJobs {
+				key := fmt.Sprintf("hook-job-%s-%d.yaml", addon.Name, i)
+				result.MRData[key] = jobYAML
+			}
+		}
 	}
 
 	return result.MRData, nil

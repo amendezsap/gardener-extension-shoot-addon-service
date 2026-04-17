@@ -101,12 +101,6 @@ var oldSeedMRNames = func(addonName string) []string {
 	}
 }
 
-// deleteHookData holds pre/post-delete hook manifests for an addon.
-type deleteHookData struct {
-	PreDelete  [][]byte
-	PostDelete [][]byte
-}
-
 // actuator implements the extension.Actuator interface.
 type actuator struct {
 	client             client.Client
@@ -119,9 +113,6 @@ type actuator struct {
 	seedProviderChecked        bool
 	managedKubernetesProvider  string
 	managedKubernetesChecked   bool
-	// deleteHooks stores pre/post-delete hook manifests keyed by addon name.
-	// Populated during Reconcile, consumed during Delete.
-	deleteHooks                map[string]*deleteHookData
 	mu                         sync.Mutex
 }
 
@@ -410,7 +401,7 @@ metadata:
 			}
 		}
 
-		secretData, err := a.renderAddonChart(log, addon, meta, manifest, configMapValues, addonOverride)
+		secretData, err := a.renderAddonChart(ctx, log, addon, meta, manifest, configMapValues, addonOverride)
 		if err != nil {
 			return fmt.Errorf("failed to render chart for addon %s: %w", addon.Name, err)
 		}
@@ -513,7 +504,7 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 	for i := range manifest.Addons {
 		addon := &manifest.Addons[i]
 		if addon.Hooks != nil && addon.Hooks.Include {
-			if err := a.executeDeleteHooks(ctx, log, targetNS, addon.Name, "pre-delete"); err != nil {
+			if err := a.executeDeleteHooks(ctx, log, ex.Namespace, targetNS, addon.Name, "pre-delete"); err != nil {
 				if addon.Hooks.ShouldAbortOnDeleteFailure() {
 					return fmt.Errorf("pre-delete hook failed for addon %s (policy: Abort): %w", addon.Name, err)
 				}
@@ -537,7 +528,7 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 	for i := range manifest.Addons {
 		addon := &manifest.Addons[i]
 		if addon.Hooks != nil && addon.Hooks.Include {
-			if err := a.executeDeleteHooks(ctx, log, targetNS, addon.Name, "post-delete"); err != nil {
+			if err := a.executeDeleteHooks(ctx, log, ex.Namespace, targetNS, addon.Name, "post-delete"); err != nil {
 				if addon.Hooks.ShouldAbortOnDeleteFailure() {
 					errs = append(errs, fmt.Errorf("post-delete hook failed for addon %s: %w", addon.Name, err))
 				} else {
@@ -1059,7 +1050,7 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 			continue
 		}
 
-		secretData, err := a.renderAddonChart(log, addon, meta, manifest, configMapValues, nil)
+		secretData, err := a.renderAddonChart(ctx, log, addon, meta, manifest, configMapValues, nil)
 		if err != nil {
 			log.Error(err, "Failed to render seed addon chart", "addon", addon.Name)
 			continue
@@ -1798,7 +1789,7 @@ data:
 //
 //	{{ .Region }}   -> meta.Region
 //	{{ .SeedName }} -> meta.SeedName
-func (a *actuator) renderAddonChart(log logr.Logger, addon *addonpkg.Addon, meta *shootMetadata, manifest *addonpkg.AddonManifest, configMapValues map[string]string, perShootOverride *config.AddonOverride) (map[string][]byte, error) {
+func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon *addonpkg.Addon, meta *shootMetadata, manifest *addonpkg.AddonManifest, configMapValues map[string]string, perShootOverride *config.AddonOverride) (map[string][]byte, error) {
 	merged := map[string]interface{}{}
 
 	if configMapValues != nil {
@@ -1892,7 +1883,7 @@ func (a *actuator) renderAddonChart(log logr.Logger, addon *addonpkg.Addon, meta
 	// the hook-aware renderer which includes hook-annotated templates and
 	// captures delete hooks separately.
 	if addon.Hooks != nil && addon.Hooks.Include {
-		return a.renderAddonChartWithHooks(log, addon, releaseName, ns, merged)
+		return a.renderAddonChartWithHooks(ctx, log, addon, releaseName, ns, meta.ControlNamespace, merged)
 	}
 
 	// Standard rendering path: Gardener chartrenderer (hooks silently dropped)
@@ -1928,7 +1919,7 @@ func (a *actuator) renderAddonChart(log logr.Logger, addon *addonpkg.Addon, meta
 // renderAddonChartWithHooks uses the hook-aware renderer to include Helm
 // hook-annotated templates. Delete hooks are stored in a separate secret
 // for execution during addon removal.
-func (a *actuator) renderAddonChartWithHooks(log logr.Logger, addon *addonpkg.Addon, releaseName, namespace string, values map[string]interface{}) (map[string][]byte, error) {
+func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logger, addon *addonpkg.Addon, releaseName, namespace, controlPlaneNamespace string, values map[string]interface{}) (map[string][]byte, error) {
 	disc, err := discovery.NewDiscoveryClientForConfig(a.restConfig)
 	if err != nil {
 		return nil, fmt.Errorf("create discovery client: %w", err)
@@ -1972,9 +1963,11 @@ func (a *actuator) renderAddonChartWithHooks(log logr.Logger, addon *addonpkg.Ad
 		return nil, fmt.Errorf("addon %s: no chart source (oci or path) specified", addon.Name)
 	}
 
-	// Store delete hooks for later execution during addon removal.
+	// Persist delete hooks in a Secret for later execution during addon removal.
+	// Stored in the shoot's control-plane namespace so they survive pod restarts
+	// and are available even after the addon is removed from the manifest.
 	if len(result.PreDeleteHooks) > 0 || len(result.PostDeleteHooks) > 0 {
-		a.storeDeleteHooks(addon.Name, result.PreDeleteHooks, result.PostDeleteHooks)
+		a.persistDeleteHooks(ctx, log, controlPlaneNamespace, addon.Name, result.PreDeleteHooks, result.PostDeleteHooks)
 	}
 
 	// Apply one-time Jobs directly (not via MR). These Jobs should run once
@@ -2072,37 +2065,74 @@ func (a *actuator) applyOneTimeJobs(ctx context.Context, log logr.Logger, restCo
 	}
 }
 
-// storeDeleteHooks saves pre/post-delete hook manifests for later execution.
-func (a *actuator) storeDeleteHooks(addonName string, preDelete, postDelete [][]byte) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.deleteHooks == nil {
-		a.deleteHooks = make(map[string]*deleteHookData)
+// deleteHookSecretName returns the Secret name for persisted delete hooks.
+func deleteHookSecretName(addonName string) string {
+	return "addon-delete-hooks-" + addonName
+}
+
+// persistDeleteHooks saves delete hook manifests to a Secret in the shoot's
+// control-plane namespace. Survives pod restarts and is available even after
+// the addon is removed from the manifest.
+func (a *actuator) persistDeleteHooks(ctx context.Context, log logr.Logger, namespace, addonName string, preDelete, postDelete [][]byte) {
+	secretName := deleteHookSecretName(addonName)
+
+	data := map[string][]byte{}
+	if len(preDelete) > 0 {
+		data["pre-delete"] = bytes.Join(preDelete, []byte("\n---\n"))
 	}
-	a.deleteHooks[addonName] = &deleteHookData{
-		PreDelete:  preDelete,
-		PostDelete: postDelete,
+	if len(postDelete) > 0 {
+		data["post-delete"] = bytes.Join(postDelete, []byte("\n---\n"))
+	}
+
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Name: secretName, Namespace: namespace}
+	err := a.client.Get(ctx, key, secret)
+
+	if err != nil {
+		// Create new Secret
+		secret = &corev1.Secret{}
+		secret.Name = secretName
+		secret.Namespace = namespace
+		secret.Data = data
+		if err := a.client.Create(ctx, secret); err != nil {
+			log.Info("Failed to persist delete hooks", "addon", addonName, "error", err)
+		} else {
+			log.Info("Persisted delete hooks", "addon", addonName, "secret", secretName)
+		}
+		return
+	}
+
+	// Update existing Secret
+	secret.Data = data
+	if err := a.client.Update(ctx, secret); err != nil {
+		log.Info("Failed to update delete hooks", "addon", addonName, "error", err)
 	}
 }
 
-// executeDeleteHooks runs pre-delete or post-delete hook manifests directly
-// on the cluster (not via MR). Uses an uncached client. Waits for Jobs to
-// complete up to the configured timeout. Returns an error if any hook
-// resource fails to apply or a Job fails/times out.
-func (a *actuator) executeDeleteHooks(ctx context.Context, log logr.Logger, namespace, addonName string, hookType string) error {
-	a.mu.Lock()
-	hooks, ok := a.deleteHooks[addonName]
-	a.mu.Unlock()
-	if !ok {
+// executeDeleteHooks reads delete hook manifests from the persisted Secret
+// and applies them directly to the cluster. Uses an uncached client. Waits
+// for Jobs to complete. Returns an error if hooks fail or time out.
+func (a *actuator) executeDeleteHooks(ctx context.Context, log logr.Logger, controlPlaneNamespace, targetNamespace, addonName string, hookType string) error {
+	secretName := deleteHookSecretName(addonName)
+
+	// Read hooks from persisted Secret
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Name: secretName, Namespace: controlPlaneNamespace}
+	if err := a.client.Get(ctx, key, secret); err != nil {
+		return nil // no hooks persisted
+	}
+
+	hookData, ok := secret.Data[hookType]
+	if !ok || len(hookData) == 0 {
 		return nil
 	}
 
+	// Split back into individual manifests
 	var manifests [][]byte
-	switch hookType {
-	case "pre-delete":
-		manifests = hooks.PreDelete
-	case "post-delete":
-		manifests = hooks.PostDelete
+	for _, doc := range bytes.Split(hookData, []byte("\n---\n")) {
+		if len(bytes.TrimSpace(doc)) > 0 {
+			manifests = append(manifests, doc)
+		}
 	}
 
 	if len(manifests) == 0 {
@@ -2124,7 +2154,7 @@ func (a *actuator) executeDeleteHooks(ctx context.Context, log logr.Logger, name
 			continue
 		}
 		for _, obj := range objs {
-			obj.SetNamespace(namespace)
+			obj.SetNamespace(targetNamespace)
 			if err := directClient.Create(ctx, obj); err != nil {
 				if apierrors.IsAlreadyExists(err) {
 					// Update if already exists
@@ -2141,7 +2171,7 @@ func (a *actuator) executeDeleteHooks(ctx context.Context, log logr.Logger, name
 	}
 
 	// Wait for any Jobs to complete
-	return a.waitForHookJobs(ctx, log, directClient, namespace, addonName, hookType)
+	return a.waitForHookJobs(ctx, log, directClient, targetNamespace, addonName, hookType)
 }
 
 // waitForHookJobs waits for delete hook Jobs to complete with a timeout.

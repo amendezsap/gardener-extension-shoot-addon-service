@@ -49,9 +49,55 @@ spec:
 		t.Error("Job kind missing from output")
 	}
 
-	// Should have delete-on-invalid-update for Jobs
+	// Should have delete-on-invalid-update because this Job has before-hook-creation
 	if !contains(result, "resources.gardener.cloud/delete-on-invalid-update") {
-		t.Error("Job should have delete-on-invalid-update annotation")
+		t.Error("Job with before-hook-creation should have delete-on-invalid-update annotation")
+	}
+}
+
+func TestStripHookAnnotationsOneTimeJob(t *testing.T) {
+	// Job with only hook-succeeded (no before-hook-creation) — one-time Job
+	input := `apiVersion: batch/v1
+kind: Job
+metadata:
+  name: create-connector
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-delete-policy": hook-succeeded
+spec:
+  template:
+    spec:
+      containers:
+        - name: connector
+          image: example/connector:latest`
+
+	result := StripHookAnnotations(input)
+
+	// Should NOT have delete-on-invalid-update — one-time Jobs should run once
+	if contains(result, "delete-on-invalid-update") {
+		t.Error("one-time Job (no before-hook-creation) should NOT have delete-on-invalid-update")
+	}
+}
+
+func TestStripHookAnnotationsJobNoDeletePolicy(t *testing.T) {
+	// Job with no hook-delete-policy at all — treat as one-time
+	input := `apiVersion: batch/v1
+kind: Job
+metadata:
+  name: setup-job
+  annotations:
+    "helm.sh/hook": pre-install
+spec:
+  template:
+    spec:
+      containers:
+        - name: setup
+          image: example/setup:latest`
+
+	result := StripHookAnnotations(input)
+
+	if contains(result, "delete-on-invalid-update") {
+		t.Error("Job without any delete policy should NOT have delete-on-invalid-update")
 	}
 }
 

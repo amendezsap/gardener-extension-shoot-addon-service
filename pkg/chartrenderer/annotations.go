@@ -20,11 +20,11 @@ var helmHookAnnotations = []string{
 // StripHookAnnotations removes helm.sh/hook* annotations from a YAML
 // manifest string. Handles multi-document YAML (--- separated).
 //
-// For Job resources, adds the Gardener annotation
+// For Job resources with a before-hook-creation delete policy, adds
 // resources.gardener.cloud/delete-on-invalid-update: "true" so the GRM
-// deletes and recreates Jobs when their immutable spec changes between
-// reconciles. This replaces the Helm hook-delete-policy: before-hook-creation
-// behavior.
+// recreates Jobs when their immutable spec changes between chart versions.
+// Jobs without before-hook-creation (one-time Jobs) do NOT get this
+// annotation — they should run once and stay completed.
 func StripHookAnnotations(manifest string) string {
 	docs := strings.Split(manifest, "\n---\n")
 	var result []string
@@ -59,16 +59,25 @@ func processDocument(doc string) string {
 		return doc // no annotations
 	}
 
+	// Read hook-delete-policy BEFORE removing it — needed to decide whether
+	// to add delete-on-invalid-update for Job resources.
+	deletePolicy, _ := annotations["helm.sh/hook-delete-policy"].(string)
+	hasBHC := strings.Contains(deletePolicy, "before-hook-creation")
+
 	// Remove Helm hook annotations
 	for _, key := range helmHookAnnotations {
 		delete(annotations, key)
 	}
 
-	// For Job resources, add delete-on-invalid-update annotation so the GRM
-	// can recreate Jobs with changed spec (Jobs are immutable). This replaces
-	// the Helm hook-delete-policy: before-hook-creation behavior.
+	// For Job resources with before-hook-creation policy, add
+	// delete-on-invalid-update so the GRM recreates the Job when its
+	// immutable spec changes between chart versions.
+	//
+	// Jobs WITHOUT before-hook-creation (e.g., one-time connector creation
+	// Jobs with only hook-succeeded) do NOT get this annotation. They should
+	// run once and stay completed — not be recreated every GRM sync cycle.
 	kind, _ := obj["kind"].(string)
-	if kind == "Job" {
+	if kind == "Job" && hasBHC {
 		annotations["resources.gardener.cloud/delete-on-invalid-update"] = "true"
 	}
 

@@ -162,28 +162,24 @@ func (a *Addon) GetNamespace(defaultNS string) string {
 	return defaultNS
 }
 
-// ManagedResourcePrefix is the standard prefix for ManagedResources created by
-// this extension, following the Gardener convention of extension-<type>-<name>.
+// ManagedResourcePrefix is used for shared infrastructure MRs (namespace,
+// registry secrets) following Gardener convention. Addon MRs use bare names.
 const ManagedResourcePrefix = "extension-shoot-addon-service-"
 
-// GetManagedResourceName returns the ManagedResource name following Gardener
-// convention: extension-shoot-addon-service-<addon-name>.
-//
-// If ManagedResourceName is set explicitly, it is used as the suffix instead
-// of the addon name. This is for backward compatibility; new addons should
-// rely on the automatic naming.
+// GetManagedResourceName returns the ManagedResource name for this addon.
+// Uses the explicit managedResourceName if set, otherwise the addon name.
+// Addon MRs use bare names (e.g., "fluent-bit") to keep Helm release names
+// stable — DaemonSet label selectors are immutable and must not change.
 func (a *Addon) GetManagedResourceName() string {
-	suffix := a.Name
 	if a.ManagedResourceName != "" {
-		suffix = a.ManagedResourceName
+		return a.ManagedResourceName
 	}
-	return ManagedResourcePrefix + suffix
+	return a.Name
 }
 
-// GetSeedManagedResourceName returns the seed-class ManagedResource name:
-// extension-shoot-addon-service-<addon-name>-seed.
+// GetSeedManagedResourceName returns the seed-class ManagedResource name.
 func (a *Addon) GetSeedManagedResourceName() string {
-	return a.GetManagedResourceName() + "-seed"
+	return "seed-" + a.GetManagedResourceName()
 }
 
 // Validate checks that the addon definition is well-formed:

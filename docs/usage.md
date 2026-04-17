@@ -109,11 +109,12 @@ addons:
 | `valuesPath` | No | Path to values directory relative to `addons/` |
 | `enabled` | Yes | Default enabled state |
 | `target` | No | Deployment target: `shoot` (default), `seed`, or `global` |
-| `managedResourceName` | No | ManagedResource name suffix (defaults to addon name; full name: `extension-shoot-addon-service-<suffix>`) |
+| `managedResourceName` | No | ManagedResource name (defaults to addon name) |
 | `shootValues` | No | Values merged into the chart at render time |
 | `image` | No | Image override configuration |
 | `imagePullSecrets` | No | List of pull secret names to inject |
 | `namespace` | No | Override target namespace (defaults to `defaultNamespace`) |
+| `keepObjectsOnRename` | No | Preserve resources when cleaning up legacy MR names (default: `false`). Set `true` for addons with only CronJobs or Deployments. Keep `false` for addons with DaemonSets (immutable label selectors). |
 
 *Exactly one chart source must be specified.
 

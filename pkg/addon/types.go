@@ -79,6 +79,13 @@ type Addon struct {
 	ShootValues         map[string]interface{} `json:"shootValues,omitempty" yaml:"shootValues,omitempty"`
 	Image               *ImageOverride         `json:"image,omitempty" yaml:"image,omitempty"`
 	ImagePullSecrets    []string               `json:"imagePullSecrets,omitempty" yaml:"imagePullSecrets,omitempty"`
+	// KeepObjectsOnRename controls cleanup behavior when migrating from legacy
+	// MR names. When true, old MR is deleted with keepObjects=true (resources
+	// preserved for the new MR to adopt). When false (default), old MR is
+	// deleted normally and the GRM removes its resources — the new MR recreates
+	// them cleanly. Use false for addons with DaemonSets (immutable selectors).
+	// Use true for addons with only CronJobs, Deployments, or other mutable resources.
+	KeepObjectsOnRename bool `json:"keepObjectsOnRename,omitempty" yaml:"keepObjectsOnRename,omitempty"`
 }
 
 // GetTarget returns the addon's deployment target, defaulting to "shoot".

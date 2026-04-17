@@ -83,6 +83,12 @@ type AddonStatus struct {
 	// is immutable and admission mutations cause perpetual diffs).
 	// Map key is the Job name, value is the spec hash.
 	HookJobHashes map[string]string `json:"hookJobHashes,omitempty"`
+	// HookResourceHashes tracks spec hashes of non-Job hook resources (Secrets)
+	// that have been included in the MR. Hook Secrets are one-time resources
+	// that may be populated by hook Jobs — re-including them would overwrite
+	// the populated data with the empty chart template version.
+	// Map key is "Kind/Name", value is the spec hash.
+	HookResourceHashes map[string]string `json:"hookResourceHashes,omitempty"`
 }
 
 // VPCEndpointStatus tracks VPC endpoint state for an addon.

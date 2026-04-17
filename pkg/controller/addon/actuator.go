@@ -391,11 +391,12 @@ metadata:
 			Target:              string(addon.GetTarget()),
 			HasHooks:            addon.Hooks != nil && addon.Hooks.Include,
 		}
-		// Carry forward hook Job hashes from previous status so the renderer
-		// knows which Jobs were already included in the MR.
+		// Carry forward hook hashes from previous status so the renderer
+		// knows which Jobs/Secrets were already included in the MR.
 		if prevStatus != nil {
 			if prev, ok := prevStatus.Addons[addon.Name]; ok && prev != nil {
 				addonStatus.HookJobHashes = prev.HookJobHashes
+				addonStatus.HookResourceHashes = prev.HookResourceHashes
 			}
 		}
 		newStatus.Addons[addon.Name] = addonStatus
@@ -2182,7 +2183,79 @@ func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logge
 		}
 	}
 
+	// One-time hook resources (Secrets) — same pattern as Jobs.
+	// On seed: apply directly (idempotent). On shoot: include in MR once,
+	// then omit to prevent the GRM from overwriting Job-populated data.
+	if len(result.OneTimeResources) > 0 {
+		if isSeedRender {
+			a.applyOneTimeResources(ctx, log, a.restConfig, namespace, addon.Name, result.OneTimeResources)
+		} else {
+			prevHashes := map[string]string{}
+			if addonStatus != nil && addonStatus.HookResourceHashes != nil {
+				prevHashes = addonStatus.HookResourceHashes
+			}
+			newHashes := map[string]string{}
+
+			for i, resYAML := range result.OneTimeResources {
+				objs, err := parseManifest(resYAML)
+				if err != nil {
+					log.Info("Failed to parse hook resource for tracking", "addon", addon.Name, "error", err)
+					continue
+				}
+				for _, obj := range objs {
+					resKey := obj.GetKind() + "/" + obj.GetName()
+					specHash := fmt.Sprintf("%x", sha256.Sum256(resYAML))[:16]
+					newHashes[resKey] = specHash
+
+					if prevHash, ok := prevHashes[resKey]; ok && prevHash == specHash {
+						log.Info("Hook resource already deployed, omitting from MR", "addon", addon.Name, "resource", resKey)
+						continue
+					}
+
+					key := fmt.Sprintf("hook-resource-%s-%d.yaml", addon.Name, i)
+					result.MRData[key] = resYAML
+					log.Info("Including hook resource in MR", "addon", addon.Name, "resource", resKey)
+				}
+			}
+
+			if addonStatus != nil {
+				addonStatus.HookResourceHashes = newHashes
+			}
+		}
+	}
+
 	return result.MRData, nil
+}
+
+// applyOneTimeResources applies non-Job hook resources (Secrets) directly
+// to the cluster. Uses create-or-skip semantics — if the resource already
+// exists, it is NOT updated, preserving data written by hook Jobs.
+func (a *actuator) applyOneTimeResources(ctx context.Context, log logr.Logger, restConfig *rest.Config, namespace, addonName string, resources [][]byte) {
+	directClient, err := client.New(restConfig, client.Options{})
+	if err != nil {
+		log.Info("Failed to create direct client for hook resources", "addon", addonName, "error", err)
+		return
+	}
+
+	for _, resYAML := range resources {
+		objs, err := parseManifest(resYAML)
+		if err != nil {
+			log.Info("Failed to parse hook resource manifest", "addon", addonName, "error", err)
+			continue
+		}
+		for _, obj := range objs {
+			obj.SetNamespace(namespace)
+			if err := directClient.Create(ctx, obj); err != nil {
+				if apierrors.IsAlreadyExists(err) {
+					log.Info("Hook resource already exists, skipping", "addon", addonName, "kind", obj.GetKind(), "name", obj.GetName())
+				} else {
+					log.Info("Failed to create hook resource", "addon", addonName, "kind", obj.GetKind(), "name", obj.GetName(), "error", err)
+				}
+			} else {
+				log.Info("Created hook resource", "addon", addonName, "kind", obj.GetKind(), "name", obj.GetName())
+			}
+		}
+	}
 }
 
 // applyOneTimeJobs applies hook Jobs directly to the cluster. Skips Jobs

@@ -72,6 +72,13 @@ type RenderResult struct {
 	// hook-succeeded policy (no before-hook-creation) — they should run once
 	// and stay completed, not be recreated by the GRM every reconcile cycle.
 	OneTimeJobs [][]byte
+
+	// OneTimeResources contains raw YAML manifests for non-Job hook resources
+	// (Secrets, ServiceAccounts, RBAC) that should be applied once and not
+	// re-applied on subsequent reconciles. This prevents the GRM from
+	// overwriting resources that were populated by hook Jobs (e.g., a
+	// placeholder Secret that gets filled with real data by a registration Job).
+	OneTimeResources [][]byte
 }
 
 // HookAwareRenderer renders Helm charts including hook-annotated templates.
@@ -176,6 +183,7 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 	var preDeleteHooks [][]byte
 	var postDeleteHooks [][]byte
 	var oneTimeJobs [][]byte
+	var oneTimeResources [][]byte
 
 	for _, hook := range hooks {
 		hookTypes := classifyHook(hook)
@@ -224,8 +232,19 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 			continue
 		}
 
-		// Regular install hooks (non-Job resources, or Jobs with
-		// before-hook-creation) → include in MR
+		// Hook Secrets are one-time resources — they may be populated
+		// by hook Jobs after creation (e.g., a connector registration
+		// Job writes credentials into an initially empty Secret). If
+		// included in the MR, the GRM would overwrite the populated
+		// data with the empty template version on every reconcile.
+		if isHookSecret(content) {
+			oneTimeResources = append(oneTimeResources, []byte(content))
+			continue
+		}
+
+		// Other hook resources (SAs, Roles, RoleBindings) go into the
+		// MR as regular resources. They're idempotent and need to
+		// persist for running workloads.
 		installHookManifests = append(installHookManifests, releaseutil.Manifest{
 			Name:    hook.Path,
 			Content: content,
@@ -245,13 +264,8 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 	}
 	mrData := rendered.AsSecretData()
 
-	// Add hook manifests directly. AsSecretData() can't handle hook manifests
-	// because they lack the Head metadata that Files() expects. We sanitize
-	// keys the same way (replace / with _).
-	//
-	// Multi-resource hook files (multiple YAML docs in one file) produce
-	// multiple hooks with the same path. We append a counter suffix to avoid
-	// key collisions in the secret data map.
+	// Add non-Secret hook manifests (SAs, Roles, RoleBindings) to MR data.
+	// These are idempotent and need to persist for running workloads.
 	hookKeyCounts := make(map[string]int)
 	for _, hm := range installHookManifests {
 		content := strings.TrimSpace(hm.Content)
@@ -262,7 +276,6 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 		hookKeyCounts[baseKey]++
 		key := baseKey
 		if hookKeyCounts[baseKey] > 1 {
-			// Append counter for duplicate file paths (multi-resource files)
 			key = strings.TrimSuffix(baseKey, ".yaml") +
 				fmt.Sprintf("_%d", hookKeyCounts[baseKey]) + ".yaml"
 		}
@@ -270,11 +283,19 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 	}
 
 	return &RenderResult{
-		MRData:          mrData,
-		PreDeleteHooks:  preDeleteHooks,
-		PostDeleteHooks: postDeleteHooks,
-		OneTimeJobs:     oneTimeJobs,
+		MRData:           mrData,
+		PreDeleteHooks:   preDeleteHooks,
+		PostDeleteHooks:  postDeleteHooks,
+		OneTimeJobs:      oneTimeJobs,
+		OneTimeResources: oneTimeResources,
 	}, nil
+}
+
+// isHookSecret returns true if the manifest content is a Secret resource.
+// Hook Secrets are routed to one-time application because hook Jobs may
+// populate them with real data after creation.
+func isHookSecret(content string) bool {
+	return strings.Contains(content, "kind: Secret")
 }
 
 // isHookJob returns true if the hook is a Job resource. ALL hook Jobs are

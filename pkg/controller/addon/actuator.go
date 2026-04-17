@@ -22,6 +22,7 @@ import (
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -50,38 +51,46 @@ import (
 // ConfigMapName is the name of the ConfigMap that holds runtime addon configuration.
 const ConfigMapName = "shoot-addon-service-config"
 
-// ManagedResource names following Gardener convention: extension-<type>-<name>.
+// ManagedResource names for shared infrastructure (namespace, registry secrets).
+// These use the Gardener convention prefix. Addon MRs use bare names.
 const (
-	mrNamespace         = addonpkg.ManagedResourcePrefix + "namespace"
-	mrNamespaceSeed     = addonpkg.ManagedResourcePrefix + "namespace-seed"
-	mrRegistrySecrets   = addonpkg.ManagedResourcePrefix + "registry-secrets"
+	mrNamespace       = addonpkg.ManagedResourcePrefix + "namespace"
+	mrNamespaceSeed   = addonpkg.ManagedResourcePrefix + "namespace-seed"
+	mrRegistrySecrets = addonpkg.ManagedResourcePrefix + "registry-secrets"
 )
 
-// oldMRNames lists all legacy ManagedResource name patterns that should be
-// cleaned up during migration to the Gardener naming convention.
-var oldMRNames = func(addonName string) []string {
-	return []string{
-		"addon-" + addonName,                                       // v0.1.x
-		"managed-resources-" + addonName,                           // v0.1.x alternate
-		addonName,                                                  // v0.2.x-v0.3.x
-	}
-}
-
-var oldSeedMRNames = func(addonName string) []string {
-	return []string{
-		"seed-addon-" + addonName,                                  // v0.2.x
-		"seed-" + addonName,                                        // v0.3.x
-		"seed-extension-shoot-addon-service-" + addonName,          // incorrect double prefix
-	}
-}
-
+// Legacy MR names from previous versions that need cleanup.
+// Namespace MR uses keepObjects=true (namespace must survive).
+// Addon MRs use keepObjects=true for the convention-prefixed names only
+// (resources are now owned by the bare-name MR).
 var oldNamespaceMRNames = []string{
 	"addon-namespace",
+}
+
+var oldSeedNamespaceMRNames = []string{
 	"seed-addon-namespace",
 }
 
 var oldRegistryMRNames = []string{
 	"addon-registry-secrets",
+}
+
+// oldShootMRNames returns legacy shoot-class MR names for an addon.
+var oldShootMRNames = func(addonName string) []string {
+	return []string{
+		"addon-" + addonName,                                             // v0.1.x
+		"managed-resources-" + addonName,                                 // v0.1.x alternate
+		addonpkg.ManagedResourcePrefix + addonName,                       // v0.4.0-v0.4.3
+	}
+}
+
+// oldSeedMRNames returns legacy seed-class MR names for an addon.
+var oldSeedMRNames = func(addonName string) []string {
+	return []string{
+		"seed-addon-" + addonName,                                        // v0.2.x
+		addonpkg.ManagedResourcePrefix + addonName + "-seed",             // v0.4.0-v0.4.3
+		"seed-extension-shoot-addon-service-" + addonName,                // incorrect double prefix
+	}
 }
 
 // actuator implements the extension.Actuator interface.
@@ -395,29 +404,28 @@ metadata:
 		}
 	}
 
-	// Clean up ManagedResources from previous naming schemes.
 	// Clean up legacy ManagedResource names from previous versions.
-	// Force-delete (strip finalizer) to prevent DeletionPending when old and
-	// new MRs reference the same underlying resources.
+	//
+	// Addon MRs: normal delete (let GRM remove resources). The new MR recreates
+	// them on the next reconcile. This avoids leaving DaemonSets with stale
+	// immutable label selectors from previous versions.
+	//
+	// Namespace MR: keepObjects=true since the namespace and all its contents
+	// must survive the rename.
 	for i := range manifest.Addons {
 		addon := &manifest.Addons[i]
 		currentName := addon.GetManagedResourceName()
-		for _, oldName := range oldMRNames(addon.Name) {
+		for _, oldName := range oldShootMRNames(addon.Name) {
 			if oldName != currentName {
-				a.cleanupRenamedManagedResource(ctx, log, ex.Namespace, oldName, currentName)
+				a.deleteOldManagedResource(ctx, log, ex.Namespace, oldName)
 			}
 		}
 	}
-	// Clean up legacy namespace and registry MR names
 	for _, oldName := range oldNamespaceMRNames {
-		if oldName != mrNamespace {
-			a.cleanupRenamedManagedResource(ctx, log, ex.Namespace, oldName, mrNamespace)
-		}
+		a.cleanupRenamedManagedResource(ctx, log, ex.Namespace, oldName, mrNamespace)
 	}
 	for _, oldName := range oldRegistryMRNames {
-		if oldName != mrRegistrySecrets {
-			a.cleanupRenamedManagedResource(ctx, log, ex.Namespace, oldName, mrRegistrySecrets)
-		}
+		a.cleanupRenamedManagedResource(ctx, log, ex.Namespace, oldName, mrRegistrySecrets)
 	}
 
 	// Track global IAM policies in status for stale policy detection
@@ -934,20 +942,18 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 		log.Info("Skipping seed addon deployment — managed seed, parent extension deploys via shoot MR",
 			"seedName", seedName)
 		// Clean up any stale seed MRs (current + legacy names).
-		for _, oldNS := range append(oldNamespaceMRNames, mrNamespaceSeed) {
-			if err := managedresources.DeleteForSeed(ctx, a.client, namespace, oldNS); err == nil {
-				log.Info("Cleaned up stale seed ManagedResource", "managedResource", oldNS)
+		for _, name := range append(oldSeedNamespaceMRNames, mrNamespaceSeed) {
+			if err := managedresources.DeleteForSeed(ctx, a.client, namespace, name); err == nil {
+				log.Info("Cleaned up stale seed ManagedResource", "managedResource", name)
 			}
 		}
 		for i := range manifest.Addons {
 			addon := &manifest.Addons[i]
 			if addon.DeploysToSeed() {
-				// Clean current name
 				mrName := addon.GetSeedManagedResourceName()
 				if err := managedresources.DeleteForSeed(ctx, a.client, namespace, mrName); err == nil {
 					log.Info("Cleaned up stale seed ManagedResource", "managedResource", mrName)
 				}
-				// Clean legacy names
 				for _, oldName := range oldSeedMRNames(addon.Name) {
 					if err := managedresources.DeleteForSeed(ctx, a.client, namespace, oldName); err == nil {
 						log.Info("Cleaned up stale seed ManagedResource", "managedResource", oldName)
@@ -1602,12 +1608,24 @@ func (a *actuator) deleteManagedResource(ctx context.Context, namespace, name st
 	return managedresources.WaitUntilDeleted(ctx, a.client, namespace, name)
 }
 
+// deleteOldManagedResource deletes a legacy addon ManagedResource and lets the
+// GRM clean up its underlying resources. The new MR recreates them on the next
+// reconcile. This is used for addon MRs where resources may have immutable
+// fields (like DaemonSet spec.selector) that changed between versions.
+func (a *actuator) deleteOldManagedResource(ctx context.Context, log logr.Logger, namespace, oldName string) {
+	if err := managedresources.DeleteForShoot(ctx, a.client, namespace, oldName); err == nil {
+		log.Info("Deleted legacy addon ManagedResource", "managedResource", oldName)
+	}
+}
+
 // cleanupRenamedManagedResource deletes a legacy ManagedResource that has been
 // replaced by a new MR with a different name but the same underlying resources.
 //
-// Sets keepObjects=true before deletion so the GRM removes the MR object
-// without deleting the underlying resources (which are now owned by the new MR).
-// This is the proper Gardener mechanism for MR ownership transfer.
+// Flow:
+//  1. Snapshot the old MR's resource inventory from status.resources
+//  2. Set keepObjects=true and delete the old MR (resources stay)
+//  3. Read the new MR's resource inventory
+//  4. Delete orphaned resources (in old but not in new)
 //
 // Uses a direct (uncached) API client to avoid registering ManagedResource
 // with the controller-runtime cache, which would trigger background watch
@@ -1619,27 +1637,72 @@ func (a *actuator) cleanupRenamedManagedResource(ctx context.Context, log logr.L
 		return
 	}
 
-	mr := &resourcesv1alpha1.ManagedResource{}
+	// 1. Read old MR and snapshot its resource inventory
+	oldMR := &resourcesv1alpha1.ManagedResource{}
 	key := types.NamespacedName{Name: oldName, Namespace: namespace}
-	if err := directClient.Get(ctx, key, mr); err != nil {
+	if err := directClient.Get(ctx, key, oldMR); err != nil {
 		return // not found — already cleaned up
 	}
+	oldResources := oldMR.Status.Resources
 
-	// Set keepObjects=true so the GRM deletes the MR but leaves the
-	// underlying resources intact (they're now owned by the new MR).
+	// 2. Set keepObjects=true and delete the old MR
 	keepObjects := true
-	mr.Spec.KeepObjects = &keepObjects
-	if err := directClient.Update(ctx, mr); err != nil {
+	oldMR.Spec.KeepObjects = &keepObjects
+	if err := directClient.Update(ctx, oldMR); err != nil {
 		log.Info("Failed to set keepObjects on old ManagedResource", "old", oldName, "error", err)
 		return
 	}
 
-	if err := directClient.Delete(ctx, mr); err != nil {
+	if err := directClient.Delete(ctx, oldMR); err != nil {
 		log.Info("Failed to delete old ManagedResource", "old", oldName, "error", err)
 		return
 	}
 
 	log.Info("Cleaned up renamed ManagedResource (keepObjects=true)", "old", oldName, "new", newName)
+
+	// 3. Read new MR's resource inventory for orphan detection
+	if len(oldResources) == 0 {
+		return // nothing to compare
+	}
+
+	newMR := &resourcesv1alpha1.ManagedResource{}
+	newKey := types.NamespacedName{Name: newName, Namespace: namespace}
+	if err := directClient.Get(ctx, newKey, newMR); err != nil {
+		log.Info("Cannot read new MR for orphan detection, skipping", "new", newName, "error", err)
+		return
+	}
+
+	// 4. Build set of new MR's resources for fast lookup
+	newSet := make(map[string]bool, len(newMR.Status.Resources))
+	for _, ref := range newMR.Status.Resources {
+		newSet[resourceKey(ref)] = true
+	}
+
+	// 5. Delete orphans: resources in old MR but not in new MR
+	for _, ref := range oldResources {
+		if newSet[resourceKey(ref)] {
+			continue // owned by new MR, skip
+		}
+		if err := deleteOrphanedResource(ctx, directClient, ref); err != nil {
+			log.Info("Failed to delete orphaned resource", "resource", resourceKey(ref), "error", err)
+		} else {
+			log.Info("Deleted orphaned resource from old ManagedResource", "resource", resourceKey(ref), "old", oldName)
+		}
+	}
+}
+
+// resourceKey returns a unique string key for a ManagedResource ObjectReference.
+func resourceKey(ref resourcesv1alpha1.ObjectReference) string {
+	return fmt.Sprintf("%s/%s/%s/%s", ref.GroupVersionKind().Group, ref.GroupVersionKind().Kind, ref.Namespace, ref.Name)
+}
+
+// deleteOrphanedResource deletes a single resource identified by an ObjectReference.
+func deleteOrphanedResource(ctx context.Context, c client.Client, ref resourcesv1alpha1.ObjectReference) error {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(ref.GroupVersionKind())
+	obj.SetName(ref.Name)
+	obj.SetNamespace(ref.Namespace)
+	return client.IgnoreNotFound(c.Delete(ctx, obj))
 }
 
 // --------------------------------------------------------------------------

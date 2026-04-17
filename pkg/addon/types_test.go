@@ -143,9 +143,9 @@ func TestGetManagedResourceName(t *testing.T) {
 		mrName   string
 		expected string
 	}{
-		{"fluent-bit", "", "extension-shoot-addon-service-fluent-bit"},
-		{"fluent-bit", "fluent-bit", "extension-shoot-addon-service-fluent-bit"},
-		{"test", "custom-name", "extension-shoot-addon-service-custom-name"},
+		{"fluent-bit", "", "fluent-bit"},
+		{"fluent-bit", "fluent-bit", "fluent-bit"},
+		{"test", "custom-name", "custom-name"},
 	}
 
 	for _, tt := range tests {
@@ -158,7 +158,7 @@ func TestGetManagedResourceName(t *testing.T) {
 
 func TestGetSeedManagedResourceName(t *testing.T) {
 	addon := &Addon{Name: "fluent-bit"}
-	expected := "extension-shoot-addon-service-fluent-bit-seed"
+	expected := "seed-fluent-bit"
 	if got := addon.GetSeedManagedResourceName(); got != expected {
 		t.Errorf("GetSeedManagedResourceName() = %q, want %q", got, expected)
 	}

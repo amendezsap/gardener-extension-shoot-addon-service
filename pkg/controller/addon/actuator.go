@@ -1790,7 +1790,10 @@ func (a *actuator) renderAddonChart(addon *addonpkg.Addon, meta *shootMetadata, 
 	}
 
 	ns := addon.GetNamespace(manifest.DefaultNamespace)
-	releaseName := addon.GetManagedResourceName()
+	// Use addon name as the Helm release name, NOT the MR name. The release
+	// name sets app.kubernetes.io/instance labels, which are immutable on
+	// DaemonSets. Changing the release name would break existing deployments.
+	releaseName := addon.Name
 
 	var rendered *chartrenderer.RenderedChart
 

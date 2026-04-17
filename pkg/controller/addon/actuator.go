@@ -50,6 +50,40 @@ import (
 // ConfigMapName is the name of the ConfigMap that holds runtime addon configuration.
 const ConfigMapName = "shoot-addon-service-config"
 
+// ManagedResource names following Gardener convention: extension-<type>-<name>.
+const (
+	mrNamespace         = addonpkg.ManagedResourcePrefix + "namespace"
+	mrNamespaceSeed     = addonpkg.ManagedResourcePrefix + "namespace-seed"
+	mrRegistrySecrets   = addonpkg.ManagedResourcePrefix + "registry-secrets"
+)
+
+// oldMRNames lists all legacy ManagedResource name patterns that should be
+// cleaned up during migration to the Gardener naming convention.
+var oldMRNames = func(addonName string) []string {
+	return []string{
+		"addon-" + addonName,                                       // v0.1.x
+		"managed-resources-" + addonName,                           // v0.1.x alternate
+		addonName,                                                  // v0.2.x-v0.3.x
+	}
+}
+
+var oldSeedMRNames = func(addonName string) []string {
+	return []string{
+		"seed-addon-" + addonName,                                  // v0.2.x
+		"seed-" + addonName,                                        // v0.3.x
+		"seed-extension-shoot-addon-service-" + addonName,          // incorrect double prefix
+	}
+}
+
+var oldNamespaceMRNames = []string{
+	"addon-namespace",
+	"seed-addon-namespace",
+}
+
+var oldRegistryMRNames = []string{
+	"addon-registry-secrets",
+}
+
 // actuator implements the extension.Actuator interface.
 type actuator struct {
 	client             client.Client
@@ -190,7 +224,7 @@ metadata:
     pod-security.kubernetes.io/enforce: privileged
 `, targetNS)),
 	}
-	if err := managedresources.CreateForShoot(ctx, a.client, ex.Namespace, "addon-namespace", "shoot-addon-service", false, nsData); err != nil {
+	if err := managedresources.CreateForShoot(ctx, a.client, ex.Namespace, mrNamespace, "shoot-addon-service", false, nsData); err != nil {
 		return fmt.Errorf("deploy target namespace: %w", err)
 	}
 
@@ -200,7 +234,7 @@ metadata:
 		if err != nil {
 			return fmt.Errorf("render registry secrets: %w", err)
 		}
-		if err := managedresources.CreateForShoot(ctx, a.client, ex.Namespace, "addon-registry-secrets", "shoot-addon-service", false, secretData); err != nil {
+		if err := managedresources.CreateForShoot(ctx, a.client, ex.Namespace, mrRegistrySecrets, "shoot-addon-service", false, secretData); err != nil {
 			return fmt.Errorf("deploy registry secrets: %w", err)
 		}
 	}
@@ -362,18 +396,27 @@ metadata:
 	}
 
 	// Clean up ManagedResources from previous naming schemes.
+	// Clean up legacy ManagedResource names from previous versions.
+	// Force-delete (strip finalizer) to prevent DeletionPending when old and
+	// new MRs reference the same underlying resources.
 	for i := range manifest.Addons {
 		addon := &manifest.Addons[i]
 		currentName := addon.GetManagedResourceName()
-		for _, oldName := range []string{"addon-" + addon.Name, "managed-resources-" + addon.Name} {
+		for _, oldName := range oldMRNames(addon.Name) {
 			if oldName != currentName {
-				// Force-delete old MRs by removing the finalizer first. The new MR
-				// already owns the same underlying resources (SA, CronJob, etc.), so
-				// letting the GRM try to clean up the old MR's resources causes it to
-				// get stuck in DeletionPending forever (can't delete resources still
-				// referenced by the new MR).
 				a.forceDeleteManagedResource(ctx, log, ex.Namespace, oldName, currentName)
 			}
+		}
+	}
+	// Clean up legacy namespace and registry MR names
+	for _, oldName := range oldNamespaceMRNames {
+		if oldName != mrNamespace {
+			a.forceDeleteManagedResource(ctx, log, ex.Namespace, oldName, mrNamespace)
+		}
+	}
+	for _, oldName := range oldRegistryMRNames {
+		if oldName != mrRegistrySecrets {
+			a.forceDeleteManagedResource(ctx, log, ex.Namespace, oldName, mrRegistrySecrets)
 		}
 	}
 
@@ -450,17 +493,20 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 		}
 	}
 
-	// 1b. Delete addon-namespace ManagedResource
-	log.Info("Deleting addon-namespace ManagedResource")
-	if err := a.deleteManagedResource(ctx, ex.Namespace, "addon-namespace"); err != nil {
-		log.Error(err, "Failed to delete addon-namespace ManagedResource")
+	// 1b. Delete namespace ManagedResource (current + legacy names)
+	log.Info("Deleting namespace ManagedResource")
+	if err := a.deleteManagedResource(ctx, ex.Namespace, mrNamespace); err != nil {
+		log.Error(err, "Failed to delete namespace ManagedResource")
 		errs = append(errs, err)
+	}
+	for _, oldName := range oldNamespaceMRNames {
+		_ = a.deleteManagedResource(ctx, ex.Namespace, oldName) // best-effort cleanup
 	}
 
 	// 1c. Delete registry secrets ManagedResource
 	if len(manifest.RegistrySecrets) > 0 {
 		log.Info("Deleting registry secrets ManagedResource")
-		if err := a.deleteManagedResource(ctx, ex.Namespace, "addon-registry-secrets"); err != nil {
+		if err := a.deleteManagedResource(ctx, ex.Namespace, mrRegistrySecrets); err != nil {
 			log.Error(err, "Failed to delete registry secrets ManagedResource")
 			errs = append(errs, err)
 		}
@@ -887,16 +933,25 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 	if a.isManagedSeed(ctx, log, seedName) {
 		log.Info("Skipping seed addon deployment — managed seed, parent extension deploys via shoot MR",
 			"seedName", seedName)
-		// Clean up any stale seed MRs from before managed seed detection was added.
-		if err := managedresources.DeleteForSeed(ctx, a.client, namespace, "seed-addon-namespace"); err == nil {
-			log.Info("Cleaned up stale seed ManagedResource", "managedResource", "seed-addon-namespace")
+		// Clean up any stale seed MRs (current + legacy names).
+		for _, oldNS := range append(oldNamespaceMRNames, mrNamespaceSeed) {
+			if err := managedresources.DeleteForSeed(ctx, a.client, namespace, oldNS); err == nil {
+				log.Info("Cleaned up stale seed ManagedResource", "managedResource", oldNS)
+			}
 		}
 		for i := range manifest.Addons {
 			addon := &manifest.Addons[i]
 			if addon.DeploysToSeed() {
-				mrName := "seed-" + addon.GetManagedResourceName()
+				// Clean current name
+				mrName := addon.GetSeedManagedResourceName()
 				if err := managedresources.DeleteForSeed(ctx, a.client, namespace, mrName); err == nil {
 					log.Info("Cleaned up stale seed ManagedResource", "managedResource", mrName)
+				}
+				// Clean legacy names
+				for _, oldName := range oldSeedMRNames(addon.Name) {
+					if err := managedresources.DeleteForSeed(ctx, a.client, namespace, oldName); err == nil {
+						log.Info("Cleaned up stale seed ManagedResource", "managedResource", oldName)
+					}
 				}
 			}
 		}
@@ -958,7 +1013,7 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 			continue
 		}
 
-		mrName := "seed-" + addon.GetManagedResourceName()
+		mrName := addon.GetSeedManagedResourceName()
 		rendered = append(rendered, renderedAddon{addon, mrName, secretData})
 
 		// Hash the rendered output for change detection
@@ -994,7 +1049,7 @@ metadata:
     gardener.cloud/role: extension
 `, targetNS)),
 	}
-	if err := managedresources.CreateForSeed(ctx, a.client, namespace, "seed-addon-namespace", false, nsData); err != nil {
+	if err := managedresources.CreateForSeed(ctx, a.client, namespace, mrNamespaceSeed, false, nsData); err != nil {
 		log.Error(err, "Failed to deploy seed addon namespace")
 		return
 	}

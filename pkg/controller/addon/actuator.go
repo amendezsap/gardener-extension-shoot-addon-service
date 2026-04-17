@@ -1972,12 +1972,59 @@ func (a *actuator) renderAddonChartWithHooks(addon *addonpkg.Addon, releaseName,
 	}
 
 	// Store delete hooks for later execution during addon removal.
-	// These are saved as a separate secret, not as part of the MR.
 	if len(result.PreDeleteHooks) > 0 || len(result.PostDeleteHooks) > 0 {
 		a.storeDeleteHooks(addon.Name, result.PreDeleteHooks, result.PostDeleteHooks)
 	}
 
+	// Apply one-time Jobs directly (not via MR). These Jobs should run once
+	// and stay completed. Skip if the Job already exists and has succeeded.
+	if len(result.OneTimeJobs) > 0 {
+		a.applyOneTimeJobs(context.Background(), a.restConfig, namespace, addon.Name, result.OneTimeJobs)
+	}
+
 	return result.MRData, nil
+}
+
+// applyOneTimeJobs applies Jobs directly to the cluster, skipping any that
+// already exist and have succeeded. This avoids the GRM recreating completed
+// Jobs every reconcile cycle.
+func (a *actuator) applyOneTimeJobs(ctx context.Context, restConfig *rest.Config, namespace, addonName string, jobs [][]byte) {
+	directClient, err := client.New(restConfig, client.Options{})
+	if err != nil {
+		return
+	}
+
+	for _, jobYAML := range jobs {
+		objs, err := parseManifest(jobYAML)
+		if err != nil {
+			continue
+		}
+
+		for _, obj := range objs {
+			if obj.GetKind() != "Job" {
+				continue
+			}
+
+			obj.SetNamespace(namespace)
+
+			// Check if Job already exists
+			existing := obj.DeepCopy()
+			err := directClient.Get(ctx, types.NamespacedName{
+				Name:      obj.GetName(),
+				Namespace: namespace,
+			}, existing)
+
+			if err == nil {
+				// Job exists — skip regardless of status (running, succeeded, failed)
+				continue
+			}
+
+			// Job doesn't exist — create it
+			if err := directClient.Create(ctx, obj); err != nil {
+				continue // already exists or other error — skip
+			}
+		}
+	}
 }
 
 // storeDeleteHooks saves pre/post-delete hook manifests for later execution.

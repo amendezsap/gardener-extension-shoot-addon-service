@@ -66,6 +66,12 @@ type RenderResult struct {
 	// PostDeleteHooks contains raw YAML manifests for post-delete hooks.
 	// Applied by the actuator after MR deletion.
 	PostDeleteHooks [][]byte
+
+	// OneTimeJobs contains raw YAML manifests for Jobs that should be applied
+	// directly by the actuator (not via MR). These are Jobs with
+	// hook-succeeded policy (no before-hook-creation) — they should run once
+	// and stay completed, not be recreated by the GRM every reconcile cycle.
+	OneTimeJobs [][]byte
 }
 
 // HookAwareRenderer renders Helm charts including hook-annotated templates.
@@ -165,10 +171,11 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 		excludeSet[t] = true
 	}
 
-	// Classify hooks into three buckets
+	// Classify hooks into buckets
 	var installHookManifests []releaseutil.Manifest
 	var preDeleteHooks [][]byte
 	var postDeleteHooks [][]byte
+	var oneTimeJobs [][]byte
 
 	for _, hook := range hooks {
 		hookTypes := classifyHook(hook)
@@ -179,7 +186,7 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 
 		// Store delete hooks for lifecycle management. Hooks with mixed
 		// events (e.g., pre-install + pre-delete) are stored for delete
-		// AND included in the MR below.
+		// AND included in the MR/OneTimeJobs below.
 		if hookTypes.isPreDelete {
 			preDeleteHooks = append(preDeleteHooks, []byte(hook.Manifest))
 		}
@@ -187,7 +194,7 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 			postDeleteHooks = append(postDeleteHooks, []byte(hook.Manifest))
 		}
 
-		// Include in MR if it has any install/upgrade event (even if also delete)
+		// Check if this hook has any install/upgrade event
 		hasInstallEvent := false
 		for _, t := range hookTypes.types {
 			if t == "pre-install" || t == "post-install" || t == "pre-upgrade" || t == "post-upgrade" {
@@ -202,17 +209,27 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 			continue
 		}
 
-		// Install/upgrade hooks (possibly also delete) → include in MR
 		content := hook.Manifest
 		if hookCfg.StripAnnotations {
 			content = StripHookAnnotations(content)
 		}
 
-		hookManifests := releaseutil.Manifest{
+		// Route one-time Jobs to direct application instead of the MR.
+		// A one-time Job is a Job without before-hook-creation policy —
+		// it should run once and stay completed, not be recreated by the
+		// GRM every reconcile cycle. Jobs WITH before-hook-creation go
+		// into the MR with delete-on-invalid-update (set by StripHookAnnotations).
+		if isOneTimeJob(hook) {
+			oneTimeJobs = append(oneTimeJobs, []byte(content))
+			continue
+		}
+
+		// Regular install hooks (non-Job resources, or Jobs with
+		// before-hook-creation) → include in MR
+		installHookManifests = append(installHookManifests, releaseutil.Manifest{
 			Name:    hook.Path,
 			Content: content,
-		}
-		installHookManifests = append(installHookManifests, hookManifests)
+		})
 	}
 
 	// Sort install hooks by name for deterministic output
@@ -256,7 +273,27 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 		MRData:          mrData,
 		PreDeleteHooks:  preDeleteHooks,
 		PostDeleteHooks: postDeleteHooks,
+		OneTimeJobs:     oneTimeJobs,
 	}, nil
+}
+
+// isOneTimeJob returns true if the hook is a Job resource WITHOUT
+// before-hook-creation delete policy. These Jobs should run once and
+// stay completed — they're applied directly by the actuator, not via MR.
+func isOneTimeJob(hook *release.Hook) bool {
+	// Check if it's a Job by parsing the manifest
+	if !strings.Contains(hook.Manifest, "kind: Job") {
+		return false
+	}
+
+	// Check if it has before-hook-creation policy
+	for _, policy := range hook.DeletePolicies {
+		if policy == release.HookBeforeHookCreation {
+			return false // NOT one-time — meant to be recreated
+		}
+	}
+
+	return true // One-time Job
 }
 
 // hookClassification holds the parsed hook types for a single hook resource.

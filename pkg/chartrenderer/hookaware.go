@@ -231,12 +231,24 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 	// Add hook manifests directly. AsSecretData() can't handle hook manifests
 	// because they lack the Head metadata that Files() expects. We sanitize
 	// keys the same way (replace / with _).
+	//
+	// Multi-resource hook files (multiple YAML docs in one file) produce
+	// multiple hooks with the same path. We append a counter suffix to avoid
+	// key collisions in the secret data map.
+	hookKeyCounts := make(map[string]int)
 	for _, hm := range installHookManifests {
 		content := strings.TrimSpace(hm.Content)
 		if len(content) == 0 {
 			continue
 		}
-		key := strings.ReplaceAll(hm.Name, "/", "_")
+		baseKey := strings.ReplaceAll(hm.Name, "/", "_")
+		hookKeyCounts[baseKey]++
+		key := baseKey
+		if hookKeyCounts[baseKey] > 1 {
+			// Append counter for duplicate file paths (multi-resource files)
+			key = strings.TrimSuffix(baseKey, ".yaml") +
+				fmt.Sprintf("_%d", hookKeyCounts[baseKey]) + ".yaml"
+		}
 		mrData[key] = []byte(content)
 	}
 

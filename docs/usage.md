@@ -115,6 +115,7 @@ addons:
 | `imagePullSecrets` | No | List of pull secret names to inject |
 | `namespace` | No | Override target namespace (defaults to `defaultNamespace`) |
 | `keepObjectsOnRename` | No | Reserved for future use. Legacy MR cleanup always preserves resources (`keepObjects=true`). |
+| `hooks` | No | Helm hook rendering configuration. See [docs/hooks.md](hooks.md) for details. |
 
 *Exactly one chart source must be specified.
 

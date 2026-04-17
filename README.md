@@ -74,6 +74,7 @@ Seed Cluster
 - **Managed seed aware** — skips seed addon deployment on managed seeds (parent seed handles it)
 - **AWS infrastructure** — optional IAM policy attachment and VPC endpoint management per addon
 - **Per-shoot overrides** — shoots can enable/disable addons or toggle features via `providerConfig` (planned)
+- **Helm hook support** — opt-in rendering of hook-annotated templates (pre-install Jobs, delete lifecycle). See [docs/hooks.md](docs/hooks.md)
 - **GRM namespace provisioner** — in-process webhook ensures ManagedResources can deploy to any namespace
 
 ## Quick Start

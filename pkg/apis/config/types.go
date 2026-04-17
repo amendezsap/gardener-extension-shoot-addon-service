@@ -69,8 +69,14 @@ type ProviderStatus struct {
 	GCPNodeServiceAccount string `json:"gcpNodeServiceAccount,omitempty"`
 }
 
-// AddonStatus holds the state for a single addon.
+// AddonStatus holds the state for a single addon, used for removal detection.
 type AddonStatus struct {
+	// ManagedResourceName is the shoot-class MR name for this addon.
+	ManagedResourceName string `json:"managedResourceName,omitempty"`
+	// Target is the addon's deployment target (shoot, seed, global).
+	Target string `json:"target,omitempty"`
+	// HasHooks indicates the addon had hooks.include: true.
+	HasHooks bool `json:"hasHooks,omitempty"`
 }
 
 // VPCEndpointStatus tracks VPC endpoint state for an addon.

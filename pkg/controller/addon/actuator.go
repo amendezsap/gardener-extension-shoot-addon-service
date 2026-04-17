@@ -385,8 +385,11 @@ metadata:
 
 		log.Info("Reconciling addon", "addon", addon.Name)
 
-		addonStatus := &config.AddonStatus{}
-
+		addonStatus := &config.AddonStatus{
+			ManagedResourceName: addon.GetManagedResourceName(),
+			Target:              string(addon.GetTarget()),
+			HasHooks:            addon.Hooks != nil && addon.Hooks.Include,
+		}
 		newStatus.Addons[addon.Name] = addonStatus
 
 		// Render the addon chart and deploy as ManagedResource
@@ -434,6 +437,59 @@ metadata:
 	}
 	for _, oldName := range oldRegistryMRNames {
 		a.cleanupRenamedManagedResource(ctx, log, ex.Namespace, oldName, mrRegistrySecrets)
+	}
+
+	// Detect and clean up addons that were removed from the manifest.
+	// Compare previous status (what was deployed) against current manifest.
+	if prevStatus != nil && len(prevStatus.Addons) > 0 {
+		currentAddons := make(map[string]bool, len(manifest.Addons))
+		for i := range manifest.Addons {
+			currentAddons[manifest.Addons[i].Name] = true
+		}
+
+		for addonName, addonStatus := range prevStatus.Addons {
+			if currentAddons[addonName] {
+				continue // still in manifest
+			}
+
+			log.Info("Addon removed from manifest, cleaning up", "addon", addonName)
+
+			// Execute pre-delete hooks if the addon had hooks
+			if addonStatus.HasHooks {
+				if err := a.executeDeleteHooks(ctx, log, ex.Namespace, manifest.DefaultNamespace, addonName, "pre-delete"); err != nil {
+					log.Info("Pre-delete hook failed for removed addon", "addon", addonName, "error", err)
+				}
+			}
+
+			// Delete the shoot MR
+			mrName := addonStatus.ManagedResourceName
+			if mrName != "" {
+				if err := a.deleteManagedResource(ctx, ex.Namespace, mrName); err != nil {
+					log.Info("Failed to delete MR for removed addon", "addon", addonName, "managedResource", mrName, "error", err)
+				} else {
+					log.Info("Deleted MR for removed addon", "addon", addonName, "managedResource", mrName)
+				}
+			}
+
+			// Execute post-delete hooks
+			if addonStatus.HasHooks {
+				if err := a.executeDeleteHooks(ctx, log, ex.Namespace, manifest.DefaultNamespace, addonName, "post-delete"); err != nil {
+					log.Info("Post-delete hook failed for removed addon", "addon", addonName, "error", err)
+				}
+
+				// Clean up the delete hooks Secret
+				hookSecret := &corev1.Secret{}
+				hookSecretKey := types.NamespacedName{
+					Name:      deleteHookSecretName(addonName),
+					Namespace: ex.Namespace,
+				}
+				if err := a.client.Get(ctx, hookSecretKey, hookSecret); err == nil {
+					if err := a.client.Delete(ctx, hookSecret); err != nil {
+						log.Info("Failed to delete hook Secret for removed addon", "addon", addonName, "error", err)
+					}
+				}
+			}
+		}
 	}
 
 	// Track global IAM policies in status for stale policy detection

@@ -19,10 +19,14 @@ import (
 	"github.com/Masterminds/sprig/v3"
 	"github.com/go-logr/logr"
 	"gopkg.in/yaml.v3"
+	helmchart "helm.sh/helm/v3/pkg/chart"
+	helmloader "helm.sh/helm/v3/pkg/chart/loader"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	yamlutil "sigs.k8s.io/yaml"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -35,8 +39,11 @@ import (
 	gardencorev1beta1 "github.com/gardener/gardener/pkg/apis/core/v1beta1"
 	extensionsv1alpha1 "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
 	resourcesv1alpha1 "github.com/gardener/gardener/pkg/apis/resources/v1alpha1"
-	"github.com/gardener/gardener/pkg/chartrenderer"
+	gardenerchartrenderer "github.com/gardener/gardener/pkg/chartrenderer"
 	"github.com/gardener/gardener/pkg/utils/managedresources"
+	"k8s.io/client-go/discovery"
+
+	hookaware "github.com/amendezsap/gardener-extension-shoot-addon-service/pkg/chartrenderer"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
@@ -93,6 +100,12 @@ var oldSeedMRNames = func(addonName string) []string {
 	}
 }
 
+// deleteHookData holds pre/post-delete hook manifests for an addon.
+type deleteHookData struct {
+	PreDelete  [][]byte
+	PostDelete [][]byte
+}
+
 // actuator implements the extension.Actuator interface.
 type actuator struct {
 	client             client.Client
@@ -105,6 +118,9 @@ type actuator struct {
 	seedProviderChecked        bool
 	managedKubernetesProvider  string
 	managedKubernetesChecked   bool
+	// deleteHooks stores pre/post-delete hook manifests keyed by addon name.
+	// Populated during Reconcile, consumed during Delete.
+	deleteHooks                map[string]*deleteHookData
 	mu                         sync.Mutex
 }
 
@@ -490,6 +506,21 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 	// Collect errors so all cleanup steps run even if some fail
 	var errs []error
 
+	// 0. Execute pre-delete hooks for addons that have them.
+	// If deleteFailurePolicy is "Abort" and a hook fails, addon removal is blocked.
+	targetNS := manifest.DefaultNamespace
+	for i := range manifest.Addons {
+		addon := &manifest.Addons[i]
+		if addon.Hooks != nil && addon.Hooks.Include {
+			if err := a.executeDeleteHooks(ctx, log, targetNS, addon.Name, "pre-delete"); err != nil {
+				if addon.Hooks.ShouldAbortOnDeleteFailure() {
+					return fmt.Errorf("pre-delete hook failed for addon %s (policy: Abort): %w", addon.Name, err)
+				}
+				log.Info("Pre-delete hook failed, continuing with deletion (policy: Continue)", "addon", addon.Name, "error", err)
+			}
+		}
+	}
+
 	// 1. Delete ManagedResources for all addons
 	for i := range manifest.Addons {
 		addon := &manifest.Addons[i]
@@ -498,6 +529,20 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 		if err := a.deleteManagedResource(ctx, ex.Namespace, mrName); err != nil {
 			log.Error(err, "Failed to delete ManagedResource", "addon", addon.Name)
 			errs = append(errs, err)
+		}
+	}
+
+	// 1a. Execute post-delete hooks after MR deletion
+	for i := range manifest.Addons {
+		addon := &manifest.Addons[i]
+		if addon.Hooks != nil && addon.Hooks.Include {
+			if err := a.executeDeleteHooks(ctx, log, targetNS, addon.Name, "post-delete"); err != nil {
+				if addon.Hooks.ShouldAbortOnDeleteFailure() {
+					errs = append(errs, fmt.Errorf("post-delete hook failed for addon %s: %w", addon.Name, err))
+				} else {
+					log.Info("Post-delete hook failed, continuing (policy: Continue)", "addon", addon.Name, "error", err)
+				}
+			}
 		}
 	}
 
@@ -1836,22 +1881,28 @@ func (a *actuator) renderAddonChart(addon *addonpkg.Addon, meta *shootMetadata, 
 		}
 	}
 
-	// Create a chart renderer
-	renderer, err := chartrenderer.NewForConfig(a.restConfig)
-	if err != nil {
-		return nil, fmt.Errorf("create chart renderer: %w", err)
-	}
-
 	ns := addon.GetNamespace(manifest.DefaultNamespace)
 	// Use addon name as the Helm release name, NOT the MR name. The release
 	// name sets app.kubernetes.io/instance labels, which are immutable on
 	// DaemonSets. Changing the release name would break existing deployments.
 	releaseName := addon.Name
 
-	var rendered *chartrenderer.RenderedChart
+	// Hook-aware rendering path: when addon has hooks.include: true, use
+	// the hook-aware renderer which includes hook-annotated templates and
+	// captures delete hooks separately.
+	if addon.Hooks != nil && addon.Hooks.Include {
+		return a.renderAddonChartWithHooks(addon, releaseName, ns, merged)
+	}
+
+	// Standard rendering path: Gardener chartrenderer (hooks silently dropped)
+	renderer, err := gardenerchartrenderer.NewForConfig(a.restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("create chart renderer: %w", err)
+	}
+
+	var rendered *gardenerchartrenderer.RenderedChart
 
 	if addon.Chart.OCI != "" {
-		// OCI chart: pull from registry, render from archive
 		archive, err := a.pullOCIChart(addon)
 		if err != nil {
 			return nil, fmt.Errorf("pull OCI chart %s: %w", addon.Chart.OCI, err)
@@ -1861,7 +1912,6 @@ func (a *actuator) renderAddonChart(addon *addonpkg.Addon, meta *shootMetadata, 
 			return nil, fmt.Errorf("render OCI chart %s: %w", addon.Chart.OCI, err)
 		}
 	} else if addon.Chart.Path != "" {
-		// Embedded chart (existing path)
 		chartPath := "addons/" + addon.Chart.Path
 		rendered, err = renderer.RenderEmbeddedFS(embedded.Addons, chartPath, releaseName, ns, merged)
 		if err != nil {
@@ -1872,6 +1922,220 @@ func (a *actuator) renderAddonChart(addon *addonpkg.Addon, meta *shootMetadata, 
 	}
 
 	return rendered.AsSecretData(), nil
+}
+
+// renderAddonChartWithHooks uses the hook-aware renderer to include Helm
+// hook-annotated templates. Delete hooks are stored in a separate secret
+// for execution during addon removal.
+func (a *actuator) renderAddonChartWithHooks(addon *addonpkg.Addon, releaseName, namespace string, values map[string]interface{}) (map[string][]byte, error) {
+	disc, err := discovery.NewDiscoveryClientForConfig(a.restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("create discovery client: %w", err)
+	}
+	sv, err := disc.ServerVersion()
+	if err != nil {
+		return nil, fmt.Errorf("get server version: %w", err)
+	}
+
+	hookRenderer := hookaware.NewHookAwareRenderer(sv)
+
+	hookCfg := &hookaware.HookConfig{
+		Include:          true,
+		StripAnnotations: addon.Hooks.ShouldStripAnnotations(),
+		DeleteTimeout:    addon.Hooks.GetDeleteTimeout(),
+		ExcludeTypes:     addon.Hooks.GetExcludeTypes(),
+	}
+
+	var result *hookaware.RenderResult
+
+	if addon.Chart.OCI != "" {
+		archive, err := a.pullOCIChart(addon)
+		if err != nil {
+			return nil, fmt.Errorf("pull OCI chart %s: %w", addon.Chart.OCI, err)
+		}
+		result, err = hookRenderer.RenderArchive(archive, releaseName, namespace, values, hookCfg)
+		if err != nil {
+			return nil, fmt.Errorf("render OCI chart with hooks %s: %w", addon.Chart.OCI, err)
+		}
+	} else if addon.Chart.Path != "" {
+		chartPath := "addons/" + addon.Chart.Path
+		chart, err := loadEmbeddedChart(embedded.Addons, chartPath)
+		if err != nil {
+			return nil, fmt.Errorf("load embedded chart %s: %w", chartPath, err)
+		}
+		result, err = hookRenderer.RenderChart(chart, releaseName, namespace, values, hookCfg)
+		if err != nil {
+			return nil, fmt.Errorf("render embedded chart with hooks %s: %w", chartPath, err)
+		}
+	} else {
+		return nil, fmt.Errorf("addon %s: no chart source (oci or path) specified", addon.Name)
+	}
+
+	// Store delete hooks for later execution during addon removal.
+	// These are saved as a separate secret, not as part of the MR.
+	if len(result.PreDeleteHooks) > 0 || len(result.PostDeleteHooks) > 0 {
+		a.storeDeleteHooks(addon.Name, result.PreDeleteHooks, result.PostDeleteHooks)
+	}
+
+	return result.MRData, nil
+}
+
+// storeDeleteHooks saves pre/post-delete hook manifests for later execution.
+func (a *actuator) storeDeleteHooks(addonName string, preDelete, postDelete [][]byte) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.deleteHooks == nil {
+		a.deleteHooks = make(map[string]*deleteHookData)
+	}
+	a.deleteHooks[addonName] = &deleteHookData{
+		PreDelete:  preDelete,
+		PostDelete: postDelete,
+	}
+}
+
+// executeDeleteHooks runs pre-delete or post-delete hook manifests directly
+// on the cluster (not via MR). Uses an uncached client. Waits for Jobs to
+// complete up to the configured timeout. Returns an error if any hook
+// resource fails to apply or a Job fails/times out.
+func (a *actuator) executeDeleteHooks(ctx context.Context, log logr.Logger, namespace, addonName string, hookType string) error {
+	a.mu.Lock()
+	hooks, ok := a.deleteHooks[addonName]
+	a.mu.Unlock()
+	if !ok {
+		return nil
+	}
+
+	var manifests [][]byte
+	switch hookType {
+	case "pre-delete":
+		manifests = hooks.PreDelete
+	case "post-delete":
+		manifests = hooks.PostDelete
+	}
+
+	if len(manifests) == 0 {
+		return nil
+	}
+
+	directClient, err := client.New(a.restConfig, client.Options{})
+	if err != nil {
+		return fmt.Errorf("create direct client for delete hooks: %w", err)
+	}
+
+	log.Info("Executing delete hooks", "addon", addonName, "hookType", hookType, "count", len(manifests))
+
+	for _, manifest := range manifests {
+		// Apply the hook resource directly
+		objs, err := parseManifest(manifest)
+		if err != nil {
+			log.Info("Failed to parse delete hook manifest", "addon", addonName, "error", err)
+			continue
+		}
+		for _, obj := range objs {
+			obj.SetNamespace(namespace)
+			if err := directClient.Create(ctx, obj); err != nil {
+				if apierrors.IsAlreadyExists(err) {
+					// Update if already exists
+					if err := directClient.Update(ctx, obj); err != nil {
+						log.Info("Failed to update delete hook resource", "addon", addonName, "kind", obj.GetKind(), "name", obj.GetName(), "error", err)
+					}
+				} else {
+					log.Info("Failed to create delete hook resource", "addon", addonName, "kind", obj.GetKind(), "name", obj.GetName(), "error", err)
+				}
+			} else {
+				log.Info("Applied delete hook resource", "addon", addonName, "kind", obj.GetKind(), "name", obj.GetName())
+			}
+		}
+	}
+
+	// Wait for any Jobs to complete
+	return a.waitForHookJobs(ctx, log, directClient, namespace, addonName, hookType)
+}
+
+// waitForHookJobs waits for delete hook Jobs to complete with a timeout.
+// Returns an error if any Job fails or times out.
+func (a *actuator) waitForHookJobs(ctx context.Context, log logr.Logger, c client.Client, namespace, addonName, hookType string) error {
+	timeout := 300 // default
+
+	jobList := &batchv1.JobList{}
+	if err := c.List(ctx, jobList, &client.ListOptions{Namespace: namespace}); err != nil {
+		return fmt.Errorf("list Jobs for hook completion: %w", err)
+	}
+
+	var hookErr error
+	for _, job := range jobList.Items {
+		if job.CreationTimestamp.Time.Before(time.Now().Add(-5 * time.Minute)) {
+			continue // skip old jobs
+		}
+
+		log.Info("Waiting for delete hook Job to complete", "addon", addonName, "job", job.Name, "timeout", timeout)
+
+		deadline := time.Now().Add(time.Duration(timeout) * time.Second)
+		for time.Now().Before(deadline) {
+			if err := c.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: namespace}, &job); err != nil {
+				hookErr = fmt.Errorf("get Job %s: %w", job.Name, err)
+				break
+			}
+			if job.Status.Succeeded > 0 {
+				log.Info("Delete hook Job completed", "addon", addonName, "job", job.Name)
+				break
+			}
+			if job.Status.Failed > 0 {
+				hookErr = fmt.Errorf("delete hook Job %s failed", job.Name)
+				log.Info("Delete hook Job failed", "addon", addonName, "job", job.Name)
+				break
+			}
+			time.Sleep(5 * time.Second)
+		}
+
+		if time.Now().After(deadline) {
+			hookErr = fmt.Errorf("delete hook Job %s timed out after %ds", job.Name, timeout)
+			log.Info("Delete hook Job timed out", "addon", addonName, "job", job.Name, "timeout", timeout)
+		}
+	}
+
+	return hookErr
+}
+
+// parseManifest parses a YAML manifest into unstructured objects.
+func parseManifest(data []byte) ([]*unstructured.Unstructured, error) {
+	var result []*unstructured.Unstructured
+	docs := strings.Split(string(data), "\n---\n")
+	for _, doc := range docs {
+		doc = strings.TrimSpace(doc)
+		if doc == "" || doc == "---" {
+			continue
+		}
+		obj := &unstructured.Unstructured{}
+		if err := yamlutil.Unmarshal([]byte(doc), &obj.Object); err != nil {
+			return nil, fmt.Errorf("unmarshal YAML: %w", err)
+		}
+		if obj.GetKind() != "" {
+			result = append(result, obj)
+		}
+	}
+	return result, nil
+}
+
+// loadEmbeddedChart loads a chart from the embedded filesystem.
+func loadEmbeddedChart(efs fs.ReadFileFS, chartPath string) (*helmchart.Chart, error) {
+	var files []*helmloader.BufferedFile
+	err := fs.WalkDir(efs, chartPath, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		data, err := efs.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		relPath := strings.TrimPrefix(p, chartPath+"/")
+		files = append(files, &helmloader.BufferedFile{Name: relPath, Data: data})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return helmloader.LoadFiles(files)
 }
 
 // pullOCIChart pulls a chart from OCI with fallback to cache.

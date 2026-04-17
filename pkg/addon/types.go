@@ -84,6 +84,76 @@ type Addon struct {
 	// The Helm release name is stable (addon name), so all resource types
 	// including DaemonSets are safe to preserve.
 	KeepObjectsOnRename bool `json:"keepObjectsOnRename,omitempty" yaml:"keepObjectsOnRename,omitempty"`
+
+	// Hooks controls Helm hook rendering behavior. When nil, hooks are
+	// silently dropped (historical Gardener behavior). Set hooks.include: true
+	// to render hook-annotated templates.
+	Hooks *AddonHookConfig `json:"hooks,omitempty" yaml:"hooks,omitempty"`
+}
+
+// AddonHookConfig controls Helm hook rendering for an addon.
+type AddonHookConfig struct {
+	// Include enables rendering of Helm hook-annotated templates.
+	// Install/upgrade hooks are included in the MR as regular resources.
+	// Delete hooks are stored separately and executed during addon removal.
+	Include bool `json:"include" yaml:"include"`
+
+	// StripAnnotations removes helm.sh/hook* annotations from included
+	// hook resources. Defaults to true when not set.
+	StripAnnotations *bool `json:"stripAnnotations,omitempty" yaml:"stripAnnotations,omitempty"`
+
+	// DeleteTimeout is the maximum seconds to wait for pre/post-delete
+	// hook Jobs to complete during addon removal. Defaults to 300.
+	DeleteTimeout *int `json:"deleteTimeout,omitempty" yaml:"deleteTimeout,omitempty"`
+
+	// DeleteFailurePolicy controls behavior when a pre/post-delete hook
+	// fails or times out. "Continue" (default) proceeds with MR deletion.
+	// "Abort" returns an error, blocking addon removal until the hook succeeds.
+	DeleteFailurePolicy string `json:"deleteFailurePolicy,omitempty" yaml:"deleteFailurePolicy,omitempty"`
+
+	// ExcludeTypes lists hook types to exclude. Defaults to ["test"].
+	// Valid values: pre-install, post-install, pre-upgrade, post-upgrade,
+	// pre-delete, post-delete, pre-rollback, post-rollback, test.
+	ExcludeTypes []string `json:"excludeTypes,omitempty" yaml:"excludeTypes,omitempty"`
+}
+
+// ShouldStripAnnotations returns whether hook annotations should be stripped.
+func (h *AddonHookConfig) ShouldStripAnnotations() bool {
+	if h.StripAnnotations == nil {
+		return true // default
+	}
+	return *h.StripAnnotations
+}
+
+// GetDeleteTimeout returns the delete hook timeout in seconds.
+func (h *AddonHookConfig) GetDeleteTimeout() int {
+	if h.DeleteTimeout == nil {
+		return 300 // default
+	}
+	return *h.DeleteTimeout
+}
+
+// GetDeleteFailurePolicy returns the delete hook failure policy.
+// Defaults to "Continue".
+func (h *AddonHookConfig) GetDeleteFailurePolicy() string {
+	if h.DeleteFailurePolicy == "" || h.DeleteFailurePolicy == "Continue" {
+		return "Continue"
+	}
+	return h.DeleteFailurePolicy
+}
+
+// ShouldAbortOnDeleteFailure returns true if delete hooks should block
+// addon removal on failure.
+func (h *AddonHookConfig) ShouldAbortOnDeleteFailure() bool {
+	return h.GetDeleteFailurePolicy() == "Abort"
+}
+
+// GetExcludeTypes returns the hook types to exclude.
+func (h *AddonHookConfig) GetExcludeTypes() []string {
+	if len(h.ExcludeTypes) == 0 {
+		return []string{"test"}
+	}
+	return h.ExcludeTypes
 }
 
 // GetTarget returns the addon's deployment target, defaulting to "shoot".

@@ -14,16 +14,11 @@ import (
 	"time"
 
 	"bytes"
-	"path"
 	"text/template"
 
 	"github.com/Masterminds/sprig/v3"
 	"github.com/go-logr/logr"
 	"gopkg.in/yaml.v3"
-	helmchart "helm.sh/helm/v3/pkg/chart"
-	helmloader "helm.sh/helm/v3/pkg/chart/loader"
-	"helm.sh/helm/v3/pkg/chartutil"
-	"helm.sh/helm/v3/pkg/engine"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -31,7 +26,6 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -41,6 +35,7 @@ import (
 	gardencorev1beta1 "github.com/gardener/gardener/pkg/apis/core/v1beta1"
 	extensionsv1alpha1 "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
 	resourcesv1alpha1 "github.com/gardener/gardener/pkg/apis/resources/v1alpha1"
+	"github.com/gardener/gardener/pkg/chartrenderer"
 	"github.com/gardener/gardener/pkg/utils/managedresources"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -1841,130 +1836,42 @@ func (a *actuator) renderAddonChart(addon *addonpkg.Addon, meta *shootMetadata, 
 		}
 	}
 
+	// Create a chart renderer
+	renderer, err := chartrenderer.NewForConfig(a.restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("create chart renderer: %w", err)
+	}
+
 	ns := addon.GetNamespace(manifest.DefaultNamespace)
 	// Use addon name as the Helm release name, NOT the MR name. The release
 	// name sets app.kubernetes.io/instance labels, which are immutable on
 	// DaemonSets. Changing the release name would break existing deployments.
 	releaseName := addon.Name
 
-	var chart *helmchart.Chart
+	var rendered *chartrenderer.RenderedChart
 
 	if addon.Chart.OCI != "" {
+		// OCI chart: pull from registry, render from archive
 		archive, err := a.pullOCIChart(addon)
 		if err != nil {
 			return nil, fmt.Errorf("pull OCI chart %s: %w", addon.Chart.OCI, err)
 		}
-		chart, err = helmloader.LoadArchive(bytes.NewReader(archive))
+		rendered, err = renderer.RenderArchive(archive, releaseName, ns, merged)
 		if err != nil {
-			return nil, fmt.Errorf("load OCI chart %s: %w", addon.Chart.OCI, err)
+			return nil, fmt.Errorf("render OCI chart %s: %w", addon.Chart.OCI, err)
 		}
 	} else if addon.Chart.Path != "" {
+		// Embedded chart (existing path)
 		chartPath := "addons/" + addon.Chart.Path
-		var err error
-		chart, err = loadEmbeddedChart(embedded.Addons, chartPath)
+		rendered, err = renderer.RenderEmbeddedFS(embedded.Addons, chartPath, releaseName, ns, merged)
 		if err != nil {
-			return nil, fmt.Errorf("load embedded chart %s: %w", chartPath, err)
+			return nil, fmt.Errorf("render embedded chart %s: %w", chartPath, err)
 		}
 	} else {
 		return nil, fmt.Errorf("addon %s: no chart source (oci or path) specified", addon.Name)
 	}
 
-	rendered, err := a.renderChart(chart, releaseName, ns, merged)
-	if err != nil {
-		return nil, fmt.Errorf("render chart for addon %s: %w", addon.Name, err)
-	}
-
-	return rendered, nil
-}
-
-// renderChart renders a Helm chart with proper capabilities including HelmVersion.
-// The Gardener chartrenderer does not set .Capabilities.HelmVersion, which causes
-// charts that check the Helm version (e.g., semverCompare ">=3.10") to fail.
-// This function renders directly using the Helm engine with full capabilities.
-func (a *actuator) renderChart(chart *helmchart.Chart, releaseName, namespace string, values map[string]interface{}) (map[string][]byte, error) {
-	parsedValues, err := json.Marshal(values)
-	if err != nil {
-		return nil, fmt.Errorf("marshal values: %w", err)
-	}
-
-	vals, err := chartutil.ReadValues(parsedValues)
-	if err != nil {
-		return nil, fmt.Errorf("read values: %w", err)
-	}
-
-	if err := chartutil.ProcessDependencies(chart, vals); err != nil {
-		return nil, fmt.Errorf("process dependencies: %w", err)
-	}
-
-	// Start with Helm's DefaultCapabilities which includes the correct
-	// HelmVersion from the compiled Helm library. Override KubeVersion with
-	// the real cluster version. This ensures charts that check
-	// .Capabilities.HelmVersion (e.g., semverCompare ">=3.10") get a valid response.
-	caps := chartutil.DefaultCapabilities.Copy()
-	sv, err := discovery.NewDiscoveryClientForConfigOrDie(a.restConfig).ServerVersion()
-	if err != nil {
-		return nil, fmt.Errorf("get server version: %w", err)
-	}
-	caps.KubeVersion = chartutil.KubeVersion{
-		Version: sv.GitVersion,
-		Major:   sv.Major,
-		Minor:   sv.Minor,
-	}
-
-	options := chartutil.ReleaseOptions{
-		Name:      releaseName,
-		Namespace: namespace,
-		Revision:  1,
-		IsInstall: true,
-	}
-
-	valuesToRender, err := chartutil.ToRenderValues(chart, vals, options, caps)
-	if err != nil {
-		return nil, fmt.Errorf("build render values: %w", err)
-	}
-
-	eng := &engine.Engine{}
-	files, err := eng.Render(chart, valuesToRender)
-	if err != nil {
-		return nil, fmt.Errorf("render chart: %w", err)
-	}
-
-	// Convert to secret data format, removing NOTES.txt and partials
-	result := make(map[string][]byte)
-	for k, v := range files {
-		if strings.HasSuffix(k, "NOTES.txt") || strings.HasPrefix(path.Base(k), "_") {
-			continue
-		}
-		data := strings.TrimSpace(v)
-		if len(data) == 0 {
-			continue
-		}
-		result[k] = []byte(data)
-	}
-
-	return result, nil
-}
-
-// loadEmbeddedChart loads a chart from the embedded filesystem.
-func loadEmbeddedChart(efs fs.ReadFileFS, chartPath string) (*helmchart.Chart, error) {
-	// Walk the embedded FS to build a buffered chart archive
-	var files []*helmloader.BufferedFile
-	err := fs.WalkDir(efs, chartPath, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
-		data, err := efs.ReadFile(p)
-		if err != nil {
-			return err
-		}
-		relPath := strings.TrimPrefix(p, chartPath+"/")
-		files = append(files, &helmloader.BufferedFile{Name: relPath, Data: data})
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return helmloader.LoadFiles(files)
+	return rendered.AsSecretData(), nil
 }
 
 // pullOCIChart pulls a chart from OCI with fallback to cache.

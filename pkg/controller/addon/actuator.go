@@ -404,19 +404,19 @@ metadata:
 		currentName := addon.GetManagedResourceName()
 		for _, oldName := range oldMRNames(addon.Name) {
 			if oldName != currentName {
-				a.forceDeleteManagedResource(ctx, log, ex.Namespace, oldName, currentName)
+				a.cleanupRenamedManagedResource(ctx, log, ex.Namespace, oldName, currentName)
 			}
 		}
 	}
 	// Clean up legacy namespace and registry MR names
 	for _, oldName := range oldNamespaceMRNames {
 		if oldName != mrNamespace {
-			a.forceDeleteManagedResource(ctx, log, ex.Namespace, oldName, mrNamespace)
+			a.cleanupRenamedManagedResource(ctx, log, ex.Namespace, oldName, mrNamespace)
 		}
 	}
 	for _, oldName := range oldRegistryMRNames {
 		if oldName != mrRegistrySecrets {
-			a.forceDeleteManagedResource(ctx, log, ex.Namespace, oldName, mrRegistrySecrets)
+			a.cleanupRenamedManagedResource(ctx, log, ex.Namespace, oldName, mrRegistrySecrets)
 		}
 	}
 
@@ -1602,35 +1602,44 @@ func (a *actuator) deleteManagedResource(ctx context.Context, namespace, name st
 	return managedresources.WaitUntilDeleted(ctx, a.client, namespace, name)
 }
 
-// forceDeleteManagedResource removes a stale ManagedResource by stripping its
-// finalizer before deletion. This prevents the GRM from trying to delete
-// underlying resources that are now owned by a replacement ManagedResource.
+// cleanupRenamedManagedResource deletes a legacy ManagedResource that has been
+// replaced by a new MR with a different name but the same underlying resources.
 //
-// Use this only for MR renames where the new MR manages the same resources.
-// For normal deletions (extension removal), use deleteManagedResource instead.
-func (a *actuator) forceDeleteManagedResource(ctx context.Context, log logr.Logger, namespace, oldName, newName string) {
-	mr := &resourcesv1alpha1.ManagedResource{}
-	key := types.NamespacedName{Name: oldName, Namespace: namespace}
-	if err := a.client.Get(ctx, key, mr); err != nil {
-		return // not found — already cleaned up
-	}
-
-	// Remove finalizer so the GRM doesn't try to clean up resources
-	if len(mr.Finalizers) > 0 {
-		mr.Finalizers = nil
-		if err := a.client.Update(ctx, mr); err != nil {
-			log.Error(err, "Failed to remove finalizer from old ManagedResource", "old", oldName)
-			return
-		}
-	}
-
-	// Delete the MR object itself
-	if err := a.client.Delete(ctx, mr); err != nil {
-		log.Error(err, "Failed to delete old ManagedResource", "old", oldName)
+// Sets keepObjects=true before deletion so the GRM removes the MR object
+// without deleting the underlying resources (which are now owned by the new MR).
+// This is the proper Gardener mechanism for MR ownership transfer.
+//
+// Uses a direct (uncached) API client to avoid registering ManagedResource
+// with the controller-runtime cache, which would trigger background watch
+// reflectors and potentially cause RBAC-related cache poisoning.
+func (a *actuator) cleanupRenamedManagedResource(ctx context.Context, log logr.Logger, namespace, oldName, newName string) {
+	directClient, err := client.New(a.restConfig, client.Options{})
+	if err != nil {
+		log.Info("Failed to create direct client for MR cleanup", "error", err)
 		return
 	}
 
-	log.Info("Force-deleted old ManagedResource (replaced by new)", "old", oldName, "new", newName)
+	mr := &resourcesv1alpha1.ManagedResource{}
+	key := types.NamespacedName{Name: oldName, Namespace: namespace}
+	if err := directClient.Get(ctx, key, mr); err != nil {
+		return // not found — already cleaned up
+	}
+
+	// Set keepObjects=true so the GRM deletes the MR but leaves the
+	// underlying resources intact (they're now owned by the new MR).
+	keepObjects := true
+	mr.Spec.KeepObjects = &keepObjects
+	if err := directClient.Update(ctx, mr); err != nil {
+		log.Info("Failed to set keepObjects on old ManagedResource", "old", oldName, "error", err)
+		return
+	}
+
+	if err := directClient.Delete(ctx, mr); err != nil {
+		log.Info("Failed to delete old ManagedResource", "old", oldName, "error", err)
+		return
+	}
+
+	log.Info("Cleaned up renamed ManagedResource (keepObjects=true)", "old", oldName, "new", newName)
 }
 
 // --------------------------------------------------------------------------

@@ -409,7 +409,7 @@ metadata:
 			}
 		}
 
-		secretData, err := a.renderAddonChart(addon, meta, manifest, configMapValues, addonOverride)
+		secretData, err := a.renderAddonChart(log, addon, meta, manifest, configMapValues, addonOverride)
 		if err != nil {
 			return fmt.Errorf("failed to render chart for addon %s: %w", addon.Name, err)
 		}
@@ -1058,7 +1058,7 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 			continue
 		}
 
-		secretData, err := a.renderAddonChart(addon, meta, manifest, configMapValues, nil)
+		secretData, err := a.renderAddonChart(log, addon, meta, manifest, configMapValues, nil)
 		if err != nil {
 			log.Error(err, "Failed to render seed addon chart", "addon", addon.Name)
 			continue
@@ -1797,7 +1797,7 @@ data:
 //
 //	{{ .Region }}   -> meta.Region
 //	{{ .SeedName }} -> meta.SeedName
-func (a *actuator) renderAddonChart(addon *addonpkg.Addon, meta *shootMetadata, manifest *addonpkg.AddonManifest, configMapValues map[string]string, perShootOverride *config.AddonOverride) (map[string][]byte, error) {
+func (a *actuator) renderAddonChart(log logr.Logger, addon *addonpkg.Addon, meta *shootMetadata, manifest *addonpkg.AddonManifest, configMapValues map[string]string, perShootOverride *config.AddonOverride) (map[string][]byte, error) {
 	merged := map[string]interface{}{}
 
 	if configMapValues != nil {
@@ -1891,7 +1891,7 @@ func (a *actuator) renderAddonChart(addon *addonpkg.Addon, meta *shootMetadata, 
 	// the hook-aware renderer which includes hook-annotated templates and
 	// captures delete hooks separately.
 	if addon.Hooks != nil && addon.Hooks.Include {
-		return a.renderAddonChartWithHooks(addon, releaseName, ns, merged)
+		return a.renderAddonChartWithHooks(log, addon, releaseName, ns, merged)
 	}
 
 	// Standard rendering path: Gardener chartrenderer (hooks silently dropped)
@@ -1927,7 +1927,7 @@ func (a *actuator) renderAddonChart(addon *addonpkg.Addon, meta *shootMetadata, 
 // renderAddonChartWithHooks uses the hook-aware renderer to include Helm
 // hook-annotated templates. Delete hooks are stored in a separate secret
 // for execution during addon removal.
-func (a *actuator) renderAddonChartWithHooks(addon *addonpkg.Addon, releaseName, namespace string, values map[string]interface{}) (map[string][]byte, error) {
+func (a *actuator) renderAddonChartWithHooks(log logr.Logger, addon *addonpkg.Addon, releaseName, namespace string, values map[string]interface{}) (map[string][]byte, error) {
 	disc, err := discovery.NewDiscoveryClientForConfig(a.restConfig)
 	if err != nil {
 		return nil, fmt.Errorf("create discovery client: %w", err)
@@ -1979,24 +1979,26 @@ func (a *actuator) renderAddonChartWithHooks(addon *addonpkg.Addon, releaseName,
 	// Apply one-time Jobs directly (not via MR). These Jobs should run once
 	// and stay completed. Skip if the Job already exists and has succeeded.
 	if len(result.OneTimeJobs) > 0 {
-		a.applyOneTimeJobs(context.Background(), a.restConfig, namespace, addon.Name, result.OneTimeJobs)
+		a.applyOneTimeJobs(context.Background(), log, a.restConfig, namespace, addon.Name, result.OneTimeJobs)
 	}
 
 	return result.MRData, nil
 }
 
 // applyOneTimeJobs applies Jobs directly to the cluster, skipping any that
-// already exist and have succeeded. This avoids the GRM recreating completed
-// Jobs every reconcile cycle.
-func (a *actuator) applyOneTimeJobs(ctx context.Context, restConfig *rest.Config, namespace, addonName string, jobs [][]byte) {
+// already exist. This avoids the GRM recreating completed Jobs every
+// reconcile cycle.
+func (a *actuator) applyOneTimeJobs(ctx context.Context, log logr.Logger, restConfig *rest.Config, namespace, addonName string, jobs [][]byte) {
 	directClient, err := client.New(restConfig, client.Options{})
 	if err != nil {
+		log.Info("Failed to create direct client for one-time Jobs", "addon", addonName, "error", err)
 		return
 	}
 
 	for _, jobYAML := range jobs {
 		objs, err := parseManifest(jobYAML)
 		if err != nil {
+			log.Info("Failed to parse one-time Job manifest", "addon", addonName, "error", err)
 			continue
 		}
 
@@ -2006,22 +2008,33 @@ func (a *actuator) applyOneTimeJobs(ctx context.Context, restConfig *rest.Config
 			}
 
 			obj.SetNamespace(namespace)
+			jobName := obj.GetName()
 
 			// Check if Job already exists
 			existing := obj.DeepCopy()
 			err := directClient.Get(ctx, types.NamespacedName{
-				Name:      obj.GetName(),
+				Name:      jobName,
 				Namespace: namespace,
 			}, existing)
 
 			if err == nil {
-				// Job exists — skip regardless of status (running, succeeded, failed)
+				// Job exists — check status for logging
+				succeeded, _, _ := unstructured.NestedInt64(existing.Object, "status", "succeeded")
+				if succeeded > 0 {
+					log.Info("One-time Job already succeeded, skipping", "addon", addonName, "job", jobName)
+				} else {
+					log.Info("One-time Job exists, skipping", "addon", addonName, "job", jobName)
+				}
 				continue
 			}
 
 			// Job doesn't exist — create it
 			if err := directClient.Create(ctx, obj); err != nil {
-				continue // already exists or other error — skip
+				if !apierrors.IsAlreadyExists(err) {
+					log.Info("Failed to create one-time Job", "addon", addonName, "job", jobName, "error", err)
+				}
+			} else {
+				log.Info("Created one-time Job", "addon", addonName, "job", jobName)
 			}
 		}
 	}

@@ -455,10 +455,11 @@ metadata:
 
 			log.Info("Addon removed from manifest, cleaning up", "addon", addonName)
 
-			// Execute pre-delete hooks if the addon had hooks
+			// Execute pre-delete hooks if the addon had hooks.
+			// Removed addons have no hook config, so use 60s timeout and always continue.
 			if addonStatus.HasHooks {
-				if err := a.executeDeleteHooks(ctx, log, ex.Namespace, manifest.DefaultNamespace, addonName, "pre-delete"); err != nil {
-					log.Info("Pre-delete hook failed for removed addon", "addon", addonName, "error", err)
+				if err := a.executeDeleteHooks(ctx, log, ex.Namespace, manifest.DefaultNamespace, addonName, "pre-delete", 60); err != nil {
+					log.Info("Pre-delete hook failed for removed addon, continuing", "addon", addonName, "error", err)
 				}
 			}
 
@@ -483,8 +484,8 @@ metadata:
 
 			// Execute post-delete hooks
 			if addonStatus.HasHooks {
-				if err := a.executeDeleteHooks(ctx, log, ex.Namespace, manifest.DefaultNamespace, addonName, "post-delete"); err != nil {
-					log.Info("Post-delete hook failed for removed addon", "addon", addonName, "error", err)
+				if err := a.executeDeleteHooks(ctx, log, ex.Namespace, manifest.DefaultNamespace, addonName, "post-delete", 60); err != nil {
+					log.Info("Post-delete hook failed for removed addon, continuing", "addon", addonName, "error", err)
 				}
 
 				// Clean up the delete hooks Secret
@@ -570,7 +571,7 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 	for i := range manifest.Addons {
 		addon := &manifest.Addons[i]
 		if addon.Hooks != nil && addon.Hooks.Include {
-			if err := a.executeDeleteHooks(ctx, log, ex.Namespace, targetNS, addon.Name, "pre-delete"); err != nil {
+			if err := a.executeDeleteHooks(ctx, log, ex.Namespace, targetNS, addon.Name, "pre-delete", addon.Hooks.GetDeleteTimeout()); err != nil {
 				if addon.Hooks.ShouldAbortOnDeleteFailure() {
 					return fmt.Errorf("pre-delete hook failed for addon %s (policy: Abort): %w", addon.Name, err)
 				}
@@ -594,7 +595,7 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 	for i := range manifest.Addons {
 		addon := &manifest.Addons[i]
 		if addon.Hooks != nil && addon.Hooks.Include {
-			if err := a.executeDeleteHooks(ctx, log, ex.Namespace, targetNS, addon.Name, "post-delete"); err != nil {
+			if err := a.executeDeleteHooks(ctx, log, ex.Namespace, targetNS, addon.Name, "post-delete", addon.Hooks.GetDeleteTimeout()); err != nil {
 				if addon.Hooks.ShouldAbortOnDeleteFailure() {
 					errs = append(errs, fmt.Errorf("post-delete hook failed for addon %s: %w", addon.Name, err))
 				} else {
@@ -2126,10 +2127,13 @@ func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logge
 			// Direct application on the runtime — skip if Job already exists
 			a.applyOneTimeJobs(ctx, log, a.restConfig, namespace, addon.Name, result.OneTimeJobs)
 		} else {
-			// Include in MR data for shoot deployment via GRM
+			// Include in MR data for shoot deployment via GRM.
+			// Inject GRM ignore annotations so the GRM creates the Job once
+			// but never updates it (Job spec is immutable, and admission
+			// mutations would cause perpetual diffs → recreate every 60s).
 			for i, jobYAML := range result.OneTimeJobs {
 				key := fmt.Sprintf("hook-job-%s-%d.yaml", addon.Name, i)
-				result.MRData[key] = jobYAML
+				result.MRData[key] = hookaware.InjectGRMIgnoreAnnotations(jobYAML)
 			}
 		}
 	}
@@ -2150,6 +2154,11 @@ func (a *actuator) applyOneTimeJobs(ctx context.Context, log logr.Logger, restCo
 		log.Info("Failed to create direct client for hook Jobs", "addon", addonName, "error", err)
 		return
 	}
+
+	// Track newly created Jobs so we can wait for them to complete.
+	// This ensures hook Jobs finish before GRM applies Deployments that
+	// depend on their output (e.g., Secrets created by the Job).
+	var createdJobNames []string
 
 	for _, jobYAML := range jobs {
 		objs, err := parseManifest(jobYAML)
@@ -2218,7 +2227,18 @@ func (a *actuator) applyOneTimeJobs(ctx context.Context, log logr.Logger, restCo
 				}
 			} else {
 				log.Info("Created hook Job", "addon", addonName, "job", jobName)
+				createdJobNames = append(createdJobNames, jobName)
 			}
+		}
+	}
+
+	// Wait for newly created Jobs to complete before returning.
+	// On first deploy this ensures the Job (e.g., connector registration)
+	// finishes before GRM applies Deployments that depend on its output.
+	// On subsequent reconciles, Jobs are skipped (same hash) so no wait.
+	if len(createdJobNames) > 0 {
+		if err := a.waitForHookJobs(ctx, log, directClient, namespace, addonName, createdJobNames, 120); err != nil {
+			log.Info("Hook Job wait completed with error, proceeding", "addon", addonName, "error", err)
 		}
 	}
 }
@@ -2268,9 +2288,11 @@ func (a *actuator) persistDeleteHooks(ctx context.Context, log logr.Logger, name
 }
 
 // executeDeleteHooks reads delete hook manifests from the persisted Secret
-// and applies them directly to the cluster. Uses an uncached client. Waits
-// for Jobs to complete. Returns an error if hooks fail or time out.
-func (a *actuator) executeDeleteHooks(ctx context.Context, log logr.Logger, controlPlaneNamespace, targetNamespace, addonName string, hookType string) error {
+// and applies them directly to the cluster. Uses an uncached client. Only
+// waits for Jobs that were actually created during this invocation.
+// The timeout parameter controls how long to wait for Job completion.
+// A timeout of 0 uses the default (60s).
+func (a *actuator) executeDeleteHooks(ctx context.Context, log logr.Logger, controlPlaneNamespace, targetNamespace, addonName string, hookType string, timeout int) error {
 	secretName := deleteHookSecretName(addonName)
 
 	// Read hooks from persisted Secret
@@ -2304,6 +2326,9 @@ func (a *actuator) executeDeleteHooks(ctx context.Context, log logr.Logger, cont
 
 	log.Info("Executing delete hooks", "addon", addonName, "hookType", hookType, "count", len(manifests))
 
+	// Track Job names we create so we only wait for those
+	var createdJobNames []string
+
 	for _, manifest := range manifests {
 		// Apply the hook resource directly
 		objs, err := parseManifest(manifest)
@@ -2319,58 +2344,64 @@ func (a *actuator) executeDeleteHooks(ctx context.Context, log logr.Logger, cont
 					if err := directClient.Update(ctx, obj); err != nil {
 						log.Info("Failed to update delete hook resource", "addon", addonName, "kind", obj.GetKind(), "name", obj.GetName(), "error", err)
 					}
+					// If it's a Job that already exists, still track it for waiting
+					if obj.GetKind() == "Job" {
+						createdJobNames = append(createdJobNames, obj.GetName())
+					}
 				} else {
 					log.Info("Failed to create delete hook resource", "addon", addonName, "kind", obj.GetKind(), "name", obj.GetName(), "error", err)
 				}
 			} else {
 				log.Info("Applied delete hook resource", "addon", addonName, "kind", obj.GetKind(), "name", obj.GetName())
+				if obj.GetKind() == "Job" {
+					createdJobNames = append(createdJobNames, obj.GetName())
+				}
 			}
 		}
 	}
 
-	// Wait for any Jobs to complete
-	return a.waitForHookJobs(ctx, log, directClient, targetNamespace, addonName, hookType)
+	// Only wait for Jobs we actually created/found
+	return a.waitForHookJobs(ctx, log, directClient, targetNamespace, addonName, createdJobNames, timeout)
 }
 
-// waitForHookJobs waits for delete hook Jobs to complete with a timeout.
-// Returns an error if any Job fails or times out.
-func (a *actuator) waitForHookJobs(ctx context.Context, log logr.Logger, c client.Client, namespace, addonName, hookType string) error {
-	timeout := 300 // default
-
-	jobList := &batchv1.JobList{}
-	if err := c.List(ctx, jobList, &client.ListOptions{Namespace: namespace}); err != nil {
-		return fmt.Errorf("list Jobs for hook completion: %w", err)
+// waitForHookJobs waits for specific hook Jobs to complete with a timeout.
+// Only waits for Jobs whose names are in jobNames — does not list or scan
+// for other Jobs in the namespace. Returns an error if any Job fails or
+// times out, but the caller decides whether to abort or continue.
+func (a *actuator) waitForHookJobs(ctx context.Context, log logr.Logger, c client.Client, namespace, addonName string, jobNames []string, timeout int) error {
+	if len(jobNames) == 0 {
+		return nil
+	}
+	if timeout <= 0 {
+		timeout = 60
 	}
 
 	var hookErr error
-	for _, job := range jobList.Items {
-		if job.CreationTimestamp.Time.Before(time.Now().Add(-5 * time.Minute)) {
-			continue // skip old jobs
-		}
+	for _, jobName := range jobNames {
+		log.Info("Waiting for hook Job to complete", "addon", addonName, "job", jobName, "timeout", timeout)
 
-		log.Info("Waiting for delete hook Job to complete", "addon", addonName, "job", job.Name, "timeout", timeout)
-
+		job := &batchv1.Job{}
 		deadline := time.Now().Add(time.Duration(timeout) * time.Second)
 		for time.Now().Before(deadline) {
-			if err := c.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: namespace}, &job); err != nil {
-				hookErr = fmt.Errorf("get Job %s: %w", job.Name, err)
+			if err := c.Get(ctx, types.NamespacedName{Name: jobName, Namespace: namespace}, job); err != nil {
+				hookErr = fmt.Errorf("get Job %s: %w", jobName, err)
 				break
 			}
 			if job.Status.Succeeded > 0 {
-				log.Info("Delete hook Job completed", "addon", addonName, "job", job.Name)
+				log.Info("Hook Job completed", "addon", addonName, "job", jobName)
 				break
 			}
 			if job.Status.Failed > 0 {
-				hookErr = fmt.Errorf("delete hook Job %s failed", job.Name)
-				log.Info("Delete hook Job failed", "addon", addonName, "job", job.Name)
+				hookErr = fmt.Errorf("hook Job %s failed", jobName)
+				log.Info("Hook Job failed", "addon", addonName, "job", jobName)
 				break
 			}
 			time.Sleep(5 * time.Second)
 		}
 
 		if time.Now().After(deadline) {
-			hookErr = fmt.Errorf("delete hook Job %s timed out after %ds", job.Name, timeout)
-			log.Info("Delete hook Job timed out", "addon", addonName, "job", job.Name, "timeout", timeout)
+			hookErr = fmt.Errorf("hook Job %s timed out after %ds", jobName, timeout)
+			log.Info("Hook Job timed out", "addon", addonName, "job", jobName, "timeout", timeout)
 		}
 	}
 

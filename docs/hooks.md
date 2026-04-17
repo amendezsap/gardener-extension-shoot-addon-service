@@ -53,9 +53,9 @@ addons:
 
 **Job resources** are handled differently depending on context:
 
-- **Seed renders** (runtime cluster): Jobs are applied directly by the actuator with deduplication. The actuator checks if the Job already exists by comparing a spec hash annotation. Same hash = skip. Different hash (chart upgrade) = delete old + create new. This prevents the GRM from recreating completed Jobs every 60s.
+- **Seed renders** (runtime cluster): Jobs are applied directly by the actuator with deduplication and completion wait. The actuator checks if the Job already exists by comparing a spec hash annotation. Same hash = skip. Different hash (chart upgrade) = delete old + create new. Newly created Jobs are polled for completion (120s timeout) to ensure they finish before the GRM applies dependent Deployments.
 
-- **Shoot renders** (shoot clusters): Jobs are included in the MR so the GRM applies them to the shoot cluster. The extension cannot access shoot clusters directly.
+- **Shoot renders** (shoot clusters): Jobs are included in the MR with `resources.gardener.cloud/ignore` and `resources.gardener.cloud/skip-health-check` annotations. The GRM creates the Job once but never updates it, preventing perpetual recreations caused by admission mutation diffs on immutable Job specs.
 
 ### Delete Hooks (pre-delete, post-delete)
 
@@ -119,19 +119,12 @@ These permissions are needed for seed-render direct Job application and delete h
 The GRM applies MR resources in Kubernetes kind order (Helm's InstallOrder):
 - Namespaces → Secrets → ServiceAccounts → Roles → Jobs → Deployments
 
-For seed renders, the extension applies hook Jobs directly after the MR is created. On first deploy, there may be a ~30s delay while:
-1. GRM applies MR (Secrets, SAs, RBAC exist immediately)
-2. Hook Job runs (creates additional Secrets)
-3. Deployment retries pod mount until the Job-created Secret exists
-
-Subsequent reconciles skip the Job (exists with same spec hash) and the Deployment starts immediately.
+For seed renders, the extension applies hook Jobs directly and waits for them to complete (120s timeout) before returning. This ensures hook Jobs (e.g., connector registration that creates a Secret) finish before the GRM applies Deployments that mount those Secrets. On subsequent reconciles, existing Jobs with the same spec hash are skipped — no wait needed.
 
 ## Limitations
 
 | Limitation | Description |
 |---|---|
-| **Shoot-side Job churn** | On shoot renders, hook Jobs are in the MR and may be recreated by the GRM each reconcile cycle. Use `ttlSecondsAfterFinished` in chart values to limit accumulation. |
-| **No strict pre-install ordering** | Jobs and Deployments deploy simultaneously via the MR. Dependencies resolve via Kubernetes retry (~30s on first deploy). |
 | **Completed Jobs persist** | Helm's `hook-delete-policy: hook-succeeded` is not enforced. Completed Jobs remain until TTL or manual cleanup. |
 | **Rollback hooks not supported** | `pre-rollback` and `post-rollback` are not applicable — the MR model has no rollback concept. |
 

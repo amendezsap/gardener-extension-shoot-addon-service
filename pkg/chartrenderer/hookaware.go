@@ -177,17 +177,32 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 			continue
 		}
 
+		// Store delete hooks for lifecycle management. Hooks with mixed
+		// events (e.g., pre-install + pre-delete) are stored for delete
+		// AND included in the MR below.
 		if hookTypes.isPreDelete {
 			preDeleteHooks = append(preDeleteHooks, []byte(hook.Manifest))
-			continue
 		}
-
 		if hookTypes.isPostDelete {
 			postDeleteHooks = append(postDeleteHooks, []byte(hook.Manifest))
+		}
+
+		// Include in MR if it has any install/upgrade event (even if also delete)
+		hasInstallEvent := false
+		for _, t := range hookTypes.types {
+			if t == "pre-install" || t == "post-install" || t == "pre-upgrade" || t == "post-upgrade" {
+				hasInstallEvent = true
+				break
+			}
+		}
+
+		// Pure delete hooks (only pre-delete/post-delete, no install events)
+		// are NOT included in the MR — they're only for the Delete() path.
+		if !hasInstallEvent && (hookTypes.isPreDelete || hookTypes.isPostDelete) {
 			continue
 		}
 
-		// Install/upgrade/post-install/post-upgrade hooks → include in MR
+		// Install/upgrade hooks (possibly also delete) → include in MR
 		content := hook.Manifest
 		if hookCfg.StripAnnotations {
 			content = StripHookAnnotations(content)
@@ -205,16 +220,28 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 		return installHookManifests[i].Name < installHookManifests[j].Name
 	})
 
-	// Combine: install hooks first, then regular manifests
-	allManifests := append(installHookManifests, manifests...)
-
+	// Build MR secret data from regular manifests using Gardener's
+	// RenderedChart (handles key sanitization and multi-resource splitting)
 	rendered := &gardenerchartrenderer.RenderedChart{
 		ChartName: chart.Name(),
-		Manifests: allManifests,
+		Manifests: manifests,
+	}
+	mrData := rendered.AsSecretData()
+
+	// Add hook manifests directly. AsSecretData() can't handle hook manifests
+	// because they lack the Head metadata that Files() expects. We sanitize
+	// keys the same way (replace / with _).
+	for _, hm := range installHookManifests {
+		content := strings.TrimSpace(hm.Content)
+		if len(content) == 0 {
+			continue
+		}
+		key := strings.ReplaceAll(hm.Name, "/", "_")
+		mrData[key] = []byte(content)
 	}
 
 	return &RenderResult{
-		MRData:          rendered.AsSecretData(),
+		MRData:          mrData,
 		PreDeleteHooks:  preDeleteHooks,
 		PostDeleteHooks: postDeleteHooks,
 	}, nil

@@ -110,8 +110,8 @@ rules:
       - patch
       - update
       - delete
-  # Hook Jobs are applied directly by the extension (not via MR).
-  # Requires batch/jobs CRUD for connector creation, migrations, etc.
+  # Hook resources are applied directly by the extension (not via MR)
+  # for seed renders and delete hook lifecycle management.
   - apiGroups:
       - batch
     resources:
@@ -121,6 +121,27 @@ rules:
       - list
       - watch
       - create
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - serviceaccounts
+    verbs:
+      - get
+      - create
+      - update
+      - delete
+  - apiGroups:
+      - rbac.authorization.k8s.io
+    resources:
+      - roles
+      - rolebindings
+      - clusterroles
+      - clusterrolebindings
+    verbs:
+      - get
+      - create
+      - update
       - delete
 ---
 apiVersion: rbac.authorization.k8s.io/v1

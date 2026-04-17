@@ -462,13 +462,22 @@ metadata:
 				}
 			}
 
-			// Delete the shoot MR
+			// Delete the shoot MR. Fall back to addon name if ManagedResourceName
+			// wasn't tracked (deployed by older extension version).
 			mrName := addonStatus.ManagedResourceName
-			if mrName != "" {
-				if err := a.deleteManagedResource(ctx, ex.Namespace, mrName); err != nil {
-					log.Info("Failed to delete MR for removed addon", "addon", addonName, "managedResource", mrName, "error", err)
-				} else {
-					log.Info("Deleted MR for removed addon", "addon", addonName, "managedResource", mrName)
+			if mrName == "" {
+				mrName = addonName
+			}
+			if err := a.deleteManagedResource(ctx, ex.Namespace, mrName); err != nil {
+				log.Info("Failed to delete MR for removed addon", "addon", addonName, "managedResource", mrName, "error", err)
+			} else {
+				log.Info("Deleted MR for removed addon", "addon", addonName, "managedResource", mrName)
+			}
+
+			// Also try common legacy names
+			for _, legacyName := range []string{"addon-" + addonName, "seed-addon-" + addonName, "seed-" + addonName} {
+				if legacyName != mrName {
+					_ = a.deleteManagedResource(ctx, ex.Namespace, legacyName)
 				}
 			}
 

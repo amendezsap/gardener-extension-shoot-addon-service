@@ -3,6 +3,6 @@ name: gardener-extension-shoot-addon-service
 description: >-
   Gardener extension that deploys user-defined Helm chart addons to shoot clusters.
   Supports IAM policy management, VPC endpoints, and GRM namespace provisioning.
-version: 0.1.4
-appVersion: "0.1.4"
+version: 0.1.5
+appVersion: "0.1.5"
 type: application

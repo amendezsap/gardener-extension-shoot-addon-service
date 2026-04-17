@@ -21,6 +21,7 @@ import (
 	"gopkg.in/yaml.v3"
 	helmchart "helm.sh/helm/v3/pkg/chart"
 	helmloader "helm.sh/helm/v3/pkg/chart/loader"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -1985,20 +1986,24 @@ func (a *actuator) renderAddonChartWithHooks(log logr.Logger, addon *addonpkg.Ad
 	return result.MRData, nil
 }
 
-// applyOneTimeJobs applies Jobs directly to the cluster, skipping any that
-// already exist. This avoids the GRM recreating completed Jobs every
-// reconcile cycle.
+// applyOneTimeJobs applies hook Jobs directly to the cluster. Skips Jobs
+// that already exist with the same spec (same chart version). If the spec
+// changed (chart upgrade), deletes the old Job and creates the new one.
+//
+// This replaces Helm's hook lifecycle in the MR model:
+//   - before-hook-creation: honored via spec hash comparison + delete/recreate
+//   - hook-succeeded: not enforced (completed Jobs persist for debugging)
 func (a *actuator) applyOneTimeJobs(ctx context.Context, log logr.Logger, restConfig *rest.Config, namespace, addonName string, jobs [][]byte) {
 	directClient, err := client.New(restConfig, client.Options{})
 	if err != nil {
-		log.Info("Failed to create direct client for one-time Jobs", "addon", addonName, "error", err)
+		log.Info("Failed to create direct client for hook Jobs", "addon", addonName, "error", err)
 		return
 	}
 
 	for _, jobYAML := range jobs {
 		objs, err := parseManifest(jobYAML)
 		if err != nil {
-			log.Info("Failed to parse one-time Job manifest", "addon", addonName, "error", err)
+			log.Info("Failed to parse hook Job manifest", "addon", addonName, "error", err)
 			continue
 		}
 
@@ -2010,31 +2015,58 @@ func (a *actuator) applyOneTimeJobs(ctx context.Context, log logr.Logger, restCo
 			obj.SetNamespace(namespace)
 			jobName := obj.GetName()
 
+			// Compute a hash of the desired Job spec for change detection
+			desiredHash := fmt.Sprintf("%x", sha256.Sum256(jobYAML))[:16]
+
+			// Tag the Job with the spec hash so we can detect changes
+			annotations := obj.GetAnnotations()
+			if annotations == nil {
+				annotations = make(map[string]string)
+			}
+			annotations["shoot-addon-service/spec-hash"] = desiredHash
+			obj.SetAnnotations(annotations)
+
 			// Check if Job already exists
-			existing := obj.DeepCopy()
+			existing := &unstructured.Unstructured{}
+			existing.SetGroupVersionKind(obj.GroupVersionKind())
 			err := directClient.Get(ctx, types.NamespacedName{
 				Name:      jobName,
 				Namespace: namespace,
 			}, existing)
 
 			if err == nil {
-				// Job exists — check status for logging
-				succeeded, _, _ := unstructured.NestedInt64(existing.Object, "status", "succeeded")
-				if succeeded > 0 {
-					log.Info("One-time Job already succeeded, skipping", "addon", addonName, "job", jobName)
-				} else {
-					log.Info("One-time Job exists, skipping", "addon", addonName, "job", jobName)
+				// Job exists — compare spec hash
+				existingHash := ""
+				if ea := existing.GetAnnotations(); ea != nil {
+					existingHash = ea["shoot-addon-service/spec-hash"]
 				}
-				continue
+
+				if existingHash == desiredHash {
+					// Same spec — skip
+					log.Info("Hook Job unchanged, skipping", "addon", addonName, "job", jobName)
+					continue
+				}
+
+				// Spec changed (chart upgrade) — delete old Job and recreate
+				log.Info("Hook Job spec changed, recreating", "addon", addonName, "job", jobName)
+				propagation := metav1.DeletePropagationBackground
+				if err := directClient.Delete(ctx, existing, &client.DeleteOptions{
+					Raw: &metav1.DeleteOptions{PropagationPolicy: &propagation},
+				}); err != nil {
+					log.Info("Failed to delete old hook Job", "addon", addonName, "job", jobName, "error", err)
+					continue
+				}
+				// Wait briefly for deletion to propagate
+				time.Sleep(2 * time.Second)
 			}
 
-			// Job doesn't exist — create it
+			// Create the Job
 			if err := directClient.Create(ctx, obj); err != nil {
 				if !apierrors.IsAlreadyExists(err) {
-					log.Info("Failed to create one-time Job", "addon", addonName, "job", jobName, "error", err)
+					log.Info("Failed to create hook Job", "addon", addonName, "job", jobName, "error", err)
 				}
 			} else {
-				log.Info("Created one-time Job", "addon", addonName, "job", jobName)
+				log.Info("Created hook Job", "addon", addonName, "job", jobName)
 			}
 		}
 	}

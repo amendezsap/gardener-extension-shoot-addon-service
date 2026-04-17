@@ -49,9 +49,10 @@ spec:
 		t.Error("Job kind missing from output")
 	}
 
-	// Should have delete-on-invalid-update because this Job has before-hook-creation
-	if !contains(result, "resources.gardener.cloud/delete-on-invalid-update") {
-		t.Error("Job with before-hook-creation should have delete-on-invalid-update annotation")
+	// Should NOT have delete-on-invalid-update — all hook Jobs are routed to
+	// direct application, not MR. This function only processes non-Job resources.
+	if contains(result, "delete-on-invalid-update") {
+		t.Error("No hook resource should have delete-on-invalid-update (Jobs go to direct apply)")
 	}
 }
 

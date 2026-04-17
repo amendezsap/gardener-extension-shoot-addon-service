@@ -219,7 +219,7 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 		// it should run once and stay completed, not be recreated by the
 		// GRM every reconcile cycle. Jobs WITH before-hook-creation go
 		// into the MR with delete-on-invalid-update (set by StripHookAnnotations).
-		if isOneTimeJob(hook) {
+		if isHookJob(hook) {
 			oneTimeJobs = append(oneTimeJobs, []byte(content))
 			continue
 		}
@@ -277,23 +277,17 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 	}, nil
 }
 
-// isOneTimeJob returns true if the hook is a Job resource WITHOUT
-// before-hook-creation delete policy. These Jobs should run once and
-// stay completed — they're applied directly by the actuator, not via MR.
-func isOneTimeJob(hook *release.Hook) bool {
-	// Check if it's a Job by parsing the manifest
-	if !strings.Contains(hook.Manifest, "kind: Job") {
-		return false
-	}
-
-	// Check if it has before-hook-creation policy
-	for _, policy := range hook.DeletePolicies {
-		if policy == release.HookBeforeHookCreation {
-			return false // NOT one-time — meant to be recreated
-		}
-	}
-
-	return true // One-time Job
+// isHookJob returns true if the hook is a Job resource. ALL hook Jobs are
+// applied directly by the actuator (not via MR) because:
+//
+//   - Helm hook Jobs run ONCE per install/upgrade event
+//   - The GRM reconciles MR resources every 60s, recreating completed Jobs
+//   - Hook delete policies (before-hook-creation, hook-succeeded) are about
+//     cleanup in the Helm lifecycle, not about run frequency
+//
+// Direct application with skip-if-exists gives the correct "run once" behavior.
+func isHookJob(hook *release.Hook) bool {
+	return strings.Contains(hook.Manifest, "kind: Job")
 }
 
 // hookClassification holds the parsed hook types for a single hook resource.

@@ -391,6 +391,13 @@ metadata:
 			Target:              string(addon.GetTarget()),
 			HasHooks:            addon.Hooks != nil && addon.Hooks.Include,
 		}
+		// Carry forward hook Job hashes from previous status so the renderer
+		// knows which Jobs were already included in the MR.
+		if prevStatus != nil {
+			if prev, ok := prevStatus.Addons[addon.Name]; ok && prev != nil {
+				addonStatus.HookJobHashes = prev.HookJobHashes
+			}
+		}
 		newStatus.Addons[addon.Name] = addonStatus
 
 		// Render the addon chart and deploy as ManagedResource
@@ -405,7 +412,7 @@ metadata:
 			}
 		}
 
-		secretData, err := a.renderAddonChart(ctx, log, addon, meta, manifest, configMapValues, addonOverride)
+		secretData, err := a.renderAddonChart(ctx, log, addon, meta, manifest, configMapValues, addonOverride, addonStatus)
 		if err != nil {
 			return fmt.Errorf("failed to render chart for addon %s: %w", addon.Name, err)
 		}
@@ -1117,7 +1124,7 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 			continue
 		}
 
-		secretData, err := a.renderAddonChart(ctx, log, addon, meta, manifest, configMapValues, nil)
+		secretData, err := a.renderAddonChart(ctx, log, addon, meta, manifest, configMapValues, nil, nil)
 		if err != nil {
 			log.Error(err, "Failed to render seed addon chart", "addon", addon.Name)
 			continue
@@ -1937,7 +1944,7 @@ data:
 //
 //	{{ .Region }}   -> meta.Region
 //	{{ .SeedName }} -> meta.SeedName
-func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon *addonpkg.Addon, meta *shootMetadata, manifest *addonpkg.AddonManifest, configMapValues map[string]string, perShootOverride *config.AddonOverride) (map[string][]byte, error) {
+func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon *addonpkg.Addon, meta *shootMetadata, manifest *addonpkg.AddonManifest, configMapValues map[string]string, perShootOverride *config.AddonOverride, addonStatus *config.AddonStatus) (map[string][]byte, error) {
 	merged := map[string]interface{}{}
 
 	if configMapValues != nil {
@@ -2032,7 +2039,7 @@ func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon 
 	// captures delete hooks separately.
 	if addon.Hooks != nil && addon.Hooks.Include {
 		isSeedRender := meta.ClusterRole == "runtime"
-		return a.renderAddonChartWithHooks(ctx, log, addon, releaseName, ns, meta.ControlNamespace, isSeedRender, merged)
+		return a.renderAddonChartWithHooks(ctx, log, addon, releaseName, ns, meta.ControlNamespace, isSeedRender, merged, addonStatus)
 	}
 
 	// Standard rendering path: Gardener chartrenderer (hooks silently dropped)
@@ -2068,7 +2075,7 @@ func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon 
 // renderAddonChartWithHooks uses the hook-aware renderer to include Helm
 // hook-annotated templates. Delete hooks are stored in a separate secret
 // for execution during addon removal.
-func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logger, addon *addonpkg.Addon, releaseName, namespace, controlPlaneNamespace string, isSeedRender bool, values map[string]interface{}) (map[string][]byte, error) {
+func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logger, addon *addonpkg.Addon, releaseName, namespace, controlPlaneNamespace string, isSeedRender bool, values map[string]interface{}, addonStatus *config.AddonStatus) (map[string][]byte, error) {
 	disc, err := discovery.NewDiscoveryClientForConfig(a.restConfig)
 	if err != nil {
 		return nil, fmt.Errorf("create discovery client: %w", err)
@@ -2121,19 +2128,56 @@ func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logge
 
 	// One-time Jobs handling depends on render context:
 	// - Seed renders: apply directly to the runtime cluster (we have access)
-	// - Shoot renders: include in MR data (GRM applies to the shoot cluster)
+	// - Shoot renders: include in MR data only on first deploy or chart upgrade
 	if len(result.OneTimeJobs) > 0 {
 		if isSeedRender {
 			// Direct application on the runtime — skip if Job already exists
 			a.applyOneTimeJobs(ctx, log, a.restConfig, namespace, addon.Name, result.OneTimeJobs)
 		} else {
-			// Include in MR data for shoot deployment via GRM.
-			// Inject GRM ignore annotations so the GRM creates the Job once
-			// but never updates it (Job spec is immutable, and admission
-			// mutations would cause perpetual diffs → recreate every 60s).
+			// Shoot renders: include Jobs in MR only if they haven't been
+			// included before (or the spec changed). The GRM recreates Jobs
+			// every ~60s because admission mutations cause diffs on immutable
+			// spec fields. By omitting already-deployed Jobs from the MR,
+			// the GRM has nothing to reconcile.
+			prevHashes := map[string]string{}
+			if addonStatus != nil && addonStatus.HookJobHashes != nil {
+				prevHashes = addonStatus.HookJobHashes
+			}
+			newHashes := map[string]string{}
+
 			for i, jobYAML := range result.OneTimeJobs {
-				key := fmt.Sprintf("hook-job-%s-%d.yaml", addon.Name, i)
-				result.MRData[key] = hookaware.InjectGRMIgnoreAnnotations(jobYAML)
+				// Parse to get the Job name for tracking
+				objs, err := parseManifest(jobYAML)
+				if err != nil {
+					log.Info("Failed to parse hook Job for tracking", "addon", addon.Name, "error", err)
+					continue
+				}
+				for _, obj := range objs {
+					if obj.GetKind() != "Job" {
+						continue
+					}
+					jobName := obj.GetName()
+					specHash := fmt.Sprintf("%x", sha256.Sum256(jobYAML))[:16]
+					newHashes[jobName] = specHash
+
+					if prevHash, ok := prevHashes[jobName]; ok && prevHash == specHash {
+						// Job was already included in a previous MR — skip it.
+						// The GRM already created it; re-including it would
+						// cause perpetual recreations.
+						log.Info("Hook Job already deployed, omitting from MR", "addon", addon.Name, "job", jobName)
+						continue
+					}
+
+					// First deploy or chart upgrade — include in MR
+					key := fmt.Sprintf("hook-job-%s-%d.yaml", addon.Name, i)
+					result.MRData[key] = jobYAML
+					log.Info("Including hook Job in MR", "addon", addon.Name, "job", jobName)
+				}
+			}
+
+			// Update addon status with current hashes for next reconcile
+			if addonStatus != nil {
+				addonStatus.HookJobHashes = newHashes
 			}
 		}
 	}

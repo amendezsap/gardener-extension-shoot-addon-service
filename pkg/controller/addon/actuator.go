@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1153,18 +1154,99 @@ metadata:
 		return
 	}
 
+	// Build current seed addon MR name set
+	currentSeedMRNames := make(map[string]bool, len(rendered))
 	for _, r := range rendered {
 		log.Info("Deploying seed addon ManagedResource", "addon", r.addon.Name, "managedResource", r.mrName)
 		if err := managedresources.CreateForSeed(ctx, a.client, namespace, r.mrName, false, r.secretData); err != nil {
 			log.Error(err, "Failed to deploy seed addon ManagedResource", "addon", r.addon.Name)
 		}
+		currentSeedMRNames[r.mrName] = true
 	}
+
+	// Detect and clean up removed seed addons via ConfigMap state.
+	a.cleanupRemovedSeedAddons(ctx, log, namespace, currentSeedMRNames)
 
 	log.Info("Seed addon reconciliation complete")
 }
 
 // --------------------------------------------------------------------------
 // GRM ConfigMap stale detection and auto-fix
+// --------------------------------------------------------------------------
+
+// --------------------------------------------------------------------------
+// Seed addon state tracking (ConfigMap-based)
+// --------------------------------------------------------------------------
+
+const seedAddonStateCMName = "seed-addon-state"
+
+// cleanupRemovedSeedAddons compares the current set of seed addon MR names
+// against the previously stored set (in a ConfigMap). Deletes MRs for any
+// addons that were removed from the manifest.
+func (a *actuator) cleanupRemovedSeedAddons(ctx context.Context, log logr.Logger, namespace string, currentMRNames map[string]bool) {
+	extensionNS := getExtensionNamespace()
+	if extensionNS == "" {
+		extensionNS = namespace // fallback
+	}
+
+	// Read previous state
+	cm := &corev1.ConfigMap{}
+	cmKey := types.NamespacedName{Name: seedAddonStateCMName, Namespace: extensionNS}
+	previousMRNames := map[string]bool{}
+
+	if err := a.client.Get(ctx, cmKey, cm); err == nil {
+		if data, ok := cm.Data["mrNames"]; ok {
+			for _, name := range strings.Split(data, ",") {
+				name = strings.TrimSpace(name)
+				if name != "" {
+					previousMRNames[name] = true
+				}
+			}
+		}
+	}
+
+	// Detect removals: in previous but not in current
+	for mrName := range previousMRNames {
+		if currentMRNames[mrName] {
+			continue
+		}
+		log.Info("Seed addon removed, deleting MR", "managedResource", mrName)
+		if err := managedresources.DeleteForSeed(ctx, a.client, namespace, mrName); err != nil {
+			log.Info("Failed to delete removed seed addon MR", "managedResource", mrName, "error", err)
+		}
+	}
+
+	// Write current state
+	var mrNameList []string
+	for name := range currentMRNames {
+		mrNameList = append(mrNameList, name)
+	}
+	sort.Strings(mrNameList)
+
+	cmData := map[string]string{
+		"mrNames": strings.Join(mrNameList, ","),
+	}
+
+	if cm.Name == "" {
+		// Create
+		cm = &corev1.ConfigMap{}
+		cm.Name = seedAddonStateCMName
+		cm.Namespace = extensionNS
+		cm.Data = cmData
+		if err := a.client.Create(ctx, cm); err != nil {
+			log.Info("Failed to create seed addon state ConfigMap", "error", err)
+		}
+	} else {
+		// Update
+		cm.Data = cmData
+		if err := a.client.Update(ctx, cm); err != nil {
+			log.Info("Failed to update seed addon state ConfigMap", "error", err)
+		}
+	}
+}
+
+// --------------------------------------------------------------------------
+// Stale GRM detection
 // --------------------------------------------------------------------------
 
 var grmConfigMapRegex = regexp.MustCompile(`^gardener-resource-manager-[a-f0-9]{8}$`)

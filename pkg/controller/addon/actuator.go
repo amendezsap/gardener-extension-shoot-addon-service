@@ -63,9 +63,10 @@ const ConfigMapName = "shoot-addon-service-config"
 // ManagedResource names for shared infrastructure (namespace, registry secrets).
 // These use the Gardener convention prefix. Addon MRs use bare names.
 const (
-	mrNamespace       = addonpkg.ManagedResourcePrefix + "namespace"
-	mrNamespaceSeed   = addonpkg.ManagedResourcePrefix + "namespace-seed"
-	mrRegistrySecrets = addonpkg.ManagedResourcePrefix + "registry-secrets"
+	mrNamespace           = addonpkg.ManagedResourcePrefix + "namespace"
+	mrNamespaceSeed       = addonpkg.ManagedResourcePrefix + "namespace-seed"
+	mrRegistrySecrets     = addonpkg.ManagedResourcePrefix + "registry-secrets"
+	mrRegistrySecretsSeed = addonpkg.ManagedResourcePrefix + "registry-secrets-seed"
 )
 
 // Legacy MR names from previous versions that need cleanup.
@@ -1046,7 +1047,7 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 		log.Info("Skipping seed addon deployment — managed seed, parent extension deploys via shoot MR",
 			"seedName", seedName)
 		// Clean up any stale seed MRs (current + legacy names).
-		for _, name := range append(oldSeedNamespaceMRNames, mrNamespaceSeed) {
+		for _, name := range append(oldSeedNamespaceMRNames, mrNamespaceSeed, mrRegistrySecretsSeed) {
 			if err := managedresources.DeleteForSeed(ctx, a.client, namespace, name); err == nil {
 				log.Info("Cleaned up stale seed ManagedResource", "managedResource", name)
 			}
@@ -1162,6 +1163,19 @@ metadata:
 	if err := managedresources.CreateForSeed(ctx, a.client, namespace, mrNamespaceSeed, false, nsData); err != nil {
 		log.Error(err, "Failed to deploy seed addon namespace")
 		return
+	}
+
+	// Deploy registry secrets to seed namespace so seed-side pods
+	// (including hook Jobs) can pull images from private registries.
+	if len(manifest.RegistrySecrets) > 0 {
+		secretData, err := a.renderRegistrySecrets(ctx, manifest, namespace)
+		if err != nil {
+			log.Error(err, "Failed to render seed registry secrets")
+		} else {
+			if err := managedresources.CreateForSeed(ctx, a.client, namespace, mrRegistrySecretsSeed, false, secretData); err != nil {
+				log.Error(err, "Failed to deploy seed registry secrets")
+			}
+		}
 	}
 
 	// Build current seed addon MR name set

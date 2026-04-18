@@ -489,17 +489,9 @@ metadata:
 					log.Info("Post-delete hook failed for removed addon, continuing", "addon", addonName, "error", err)
 				}
 
-				// Clean up the delete hooks Secret
-				hookSecret := &corev1.Secret{}
-				hookSecretKey := types.NamespacedName{
-					Name:      deleteHookSecretName(addonName),
-					Namespace: ex.Namespace,
-				}
-				if err := a.client.Get(ctx, hookSecretKey, hookSecret); err == nil {
-					if err := a.client.Delete(ctx, hookSecret); err != nil {
-						log.Info("Failed to delete hook Secret for removed addon", "addon", addonName, "error", err)
-					}
-				}
+				// Clean up hook Secrets that survived MR deletion (keep-object),
+				// then delete the delete hooks Secret itself.
+				a.cleanupKeptHookSecrets(ctx, log, ex.Namespace, manifest.DefaultNamespace, addonName)
 			}
 		}
 	}
@@ -603,6 +595,8 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 					log.Info("Post-delete hook failed, continuing (policy: Continue)", "addon", addon.Name, "error", err)
 				}
 			}
+			// Clean up hook Secrets that survived MR deletion (keep-object)
+			a.cleanupKeptHookSecrets(ctx, log, ex.Namespace, targetNS, addon.Name)
 		}
 	}
 
@@ -2129,8 +2123,21 @@ func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logge
 	// Persist delete hooks in a Secret for later execution during addon removal.
 	// Stored in the shoot's control-plane namespace so they survive pod restarts
 	// and are available even after the addon is removed from the manifest.
+	// Also persist hook Secret names so the cleanup code knows which Secrets
+	// to delete after delete hooks complete (they have keep-object annotation
+	// and survive MR deletion).
 	if len(result.PreDeleteHooks) > 0 || len(result.PostDeleteHooks) > 0 {
-		a.persistDeleteHooks(ctx, log, controlPlaneNamespace, addon.Name, result.PreDeleteHooks, result.PostDeleteHooks)
+		var hookSecretNames []string
+		for _, secretYAML := range result.HookSecrets {
+			objs, err := parseManifest(secretYAML)
+			if err != nil {
+				continue
+			}
+			for _, obj := range objs {
+				hookSecretNames = append(hookSecretNames, obj.GetName())
+			}
+		}
+		a.persistDeleteHooks(ctx, log, controlPlaneNamespace, addon.Name, result.PreDeleteHooks, result.PostDeleteHooks, hookSecretNames)
 	}
 
 	// Hook resource handling depends on render context:
@@ -2307,10 +2314,56 @@ func deleteHookSecretName(addonName string) string {
 	return "addon-delete-hooks-" + addonName
 }
 
+// cleanupKeptHookSecrets deletes hook Secrets that survived MR deletion
+// (annotated with keep-object) and then deletes the addon-delete-hooks-*
+// Secret itself. Reads hook Secret names from the persisted delete hooks
+// Secret's "hook-secret-names" key.
+func (a *actuator) cleanupKeptHookSecrets(ctx context.Context, log logr.Logger, controlPlaneNamespace, targetNamespace, addonName string) {
+	secretName := deleteHookSecretName(addonName)
+
+	// Read the persisted delete hooks Secret to get hook Secret names
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Name: secretName, Namespace: controlPlaneNamespace}
+	if err := a.client.Get(ctx, key, secret); err != nil {
+		return // no hooks persisted, nothing to clean up
+	}
+
+	// Delete kept hook Secrets from the target namespace
+	if namesData, ok := secret.Data["hook-secret-names"]; ok && len(namesData) > 0 {
+		names := strings.Split(string(namesData), ",")
+		directClient, err := client.New(a.restConfig, client.Options{})
+		if err != nil {
+			log.Info("Failed to create client for hook Secret cleanup", "addon", addonName, "error", err)
+		} else {
+			for _, name := range names {
+				name = strings.TrimSpace(name)
+				if name == "" {
+					continue
+				}
+				s := &corev1.Secret{}
+				s.Name = name
+				s.Namespace = targetNamespace
+				if err := directClient.Delete(ctx, s); err != nil {
+					if !apierrors.IsNotFound(err) {
+						log.Info("Failed to delete kept hook Secret", "addon", addonName, "secret", name, "error", err)
+					}
+				} else {
+					log.Info("Deleted kept hook Secret", "addon", addonName, "secret", name)
+				}
+			}
+		}
+	}
+
+	// Delete the delete hooks Secret itself
+	if err := a.client.Delete(ctx, secret); err != nil {
+		log.Info("Failed to delete hook Secret", "addon", addonName, "error", err)
+	}
+}
+
 // persistDeleteHooks saves delete hook manifests to a Secret in the shoot's
 // control-plane namespace. Survives pod restarts and is available even after
 // the addon is removed from the manifest.
-func (a *actuator) persistDeleteHooks(ctx context.Context, log logr.Logger, namespace, addonName string, preDelete, postDelete [][]byte) {
+func (a *actuator) persistDeleteHooks(ctx context.Context, log logr.Logger, namespace, addonName string, preDelete, postDelete [][]byte, hookSecretNames []string) {
 	secretName := deleteHookSecretName(addonName)
 
 	data := map[string][]byte{}
@@ -2319,6 +2372,9 @@ func (a *actuator) persistDeleteHooks(ctx context.Context, log logr.Logger, name
 	}
 	if len(postDelete) > 0 {
 		data["post-delete"] = bytes.Join(postDelete, []byte("\n---\n"))
+	}
+	if len(hookSecretNames) > 0 {
+		data["hook-secret-names"] = []byte(strings.Join(hookSecretNames, ","))
 	}
 
 	secret := &corev1.Secret{}

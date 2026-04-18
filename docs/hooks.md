@@ -51,7 +51,11 @@ addons:
 
 **Non-Job, non-Secret resources** (ServiceAccounts, RBAC) are included in the ManagedResource as regular Kubernetes resources. The GRM applies them alongside main chart resources. These are idempotent and safe to re-apply.
 
-**Hook Secrets** are included in the MR with `resources.gardener.cloud/ignore: "true"`. The GRM creates them on first deploy but never updates them afterwards. This prevents the GRM from overwriting data populated by hook Jobs (e.g., a connector registration Job writes credentials into an initially empty Secret). On seed renders, Secrets are also applied directly before Jobs to ensure proper ordering.
+**Hook Secrets** are included in the MR with two GRM annotations:
+- `resources.gardener.cloud/ignore: "true"` — GRM creates on first deploy, never updates (preserves Job-populated data)
+- `resources.gardener.cloud/keep-object: "true"` — Secret survives MR deletion so delete hook Jobs can still mount it (e.g., `wiz-api-token` needed for connector deregistration)
+
+The extension cleans up kept Secrets after delete hooks complete. Hook Secret names are persisted alongside delete hooks in the `addon-delete-hooks-*` Secret for reliable cleanup. On seed renders, Secrets are also applied directly before Jobs to ensure proper ordering.
 
 **Hook Jobs** are handled differently depending on context:
 

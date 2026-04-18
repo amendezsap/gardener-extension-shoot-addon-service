@@ -2486,6 +2486,12 @@ func (a *actuator) executeShootDeleteHooks(ctx context.Context, log logr.Logger,
 		mr := &resourcesv1alpha1.ManagedResource{}
 		mrKey := types.NamespacedName{Name: mrName, Namespace: controlPlaneNamespace}
 		if err := a.client.Get(ctx, mrKey, mr); err != nil {
+			if apierrors.IsNotFound(err) {
+				// Cache may not have synced yet after CreateForShoot.
+				// The informer watch event propagates within a few seconds.
+				time.Sleep(5 * time.Second)
+				continue
+			}
 			hookErr = fmt.Errorf("get delete hook MR: %w", err)
 			break
 		}

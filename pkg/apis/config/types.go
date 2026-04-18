@@ -77,18 +77,6 @@ type AddonStatus struct {
 	Target string `json:"target,omitempty"`
 	// HasHooks indicates the addon had hooks.include: true.
 	HasHooks bool `json:"hasHooks,omitempty"`
-	// HookJobHashes tracks spec hashes of hook Jobs that have been included
-	// in the MR. On subsequent reconciles, Jobs with the same hash are skipped
-	// to prevent the GRM from recreating completed Jobs every 60s (Job spec
-	// is immutable and admission mutations cause perpetual diffs).
-	// Map key is the Job name, value is the spec hash.
-	HookJobHashes map[string]string `json:"hookJobHashes,omitempty"`
-	// HookResourceHashes tracks spec hashes of non-Job hook resources (Secrets)
-	// that have been included in the MR. Hook Secrets are one-time resources
-	// that may be populated by hook Jobs — re-including them would overwrite
-	// the populated data with the empty chart template version.
-	// Map key is "Kind/Name", value is the spec hash.
-	HookResourceHashes map[string]string `json:"hookResourceHashes,omitempty"`
 }
 
 // VPCEndpointStatus tracks VPC endpoint state for an addon.

@@ -83,15 +83,35 @@ func processDocument(doc string) string {
 	return string(out)
 }
 
-// InjectGRMIgnoreAnnotations adds resources.gardener.cloud/ignore and
-// resources.gardener.cloud/skip-health-check annotations to a YAML manifest.
-// This prevents the GRM from updating or health-checking the resource after
-// initial creation — used for shoot-side hook Jobs that should run once and
-// not be recreated every reconcile cycle.
+// InjectGRMIgnoreAnnotations adds resources.gardener.cloud/ignore to a YAML
+// manifest. The GRM creates the resource on first reconcile but never updates
+// it afterwards. Used for hook Secrets that get populated by hook Jobs — the
+// GRM must not overwrite the populated data with the empty chart template.
 func InjectGRMIgnoreAnnotations(manifest []byte) []byte {
+	return injectAnnotations(manifest, map[string]string{
+		"resources.gardener.cloud/ignore": "true",
+	})
+}
+
+// InjectGRMJobAnnotations adds annotations for hook Jobs in the MR:
+//   - ignore: GRM creates the Job once and never re-applies it (Job spec is
+//     immutable, and admission mutations cause perpetual diffs)
+//   - delete-on-invalid-update: on chart upgrade with a new Job spec, the GRM
+//     deletes the old Job and creates the new one instead of failing on
+//     immutable field validation
+//   - skip-health-check: completed/failed Jobs shouldn't block MR health
+func InjectGRMJobAnnotations(manifest []byte) []byte {
+	return injectAnnotations(manifest, map[string]string{
+		"resources.gardener.cloud/ignore":                 "true",
+		"resources.gardener.cloud/delete-on-invalid-update": "true",
+		"resources.gardener.cloud/skip-health-check":      "true",
+	})
+}
+
+func injectAnnotations(manifest []byte, toAdd map[string]string) []byte {
 	var obj map[string]interface{}
 	if err := yaml.Unmarshal(manifest, &obj); err != nil {
-		return manifest // can't parse, return as-is
+		return manifest
 	}
 
 	metadata, ok := obj["metadata"].(map[string]interface{})
@@ -105,8 +125,9 @@ func InjectGRMIgnoreAnnotations(manifest []byte) []byte {
 		annotations = map[string]interface{}{}
 	}
 
-	annotations["resources.gardener.cloud/ignore"] = "true"
-	annotations["resources.gardener.cloud/skip-health-check"] = "true"
+	for k, v := range toAdd {
+		annotations[k] = v
+	}
 	metadata["annotations"] = annotations
 
 	out, err := yaml.Marshal(obj)

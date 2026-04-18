@@ -67,18 +67,20 @@ type RenderResult struct {
 	// Applied by the actuator after MR deletion.
 	PostDeleteHooks [][]byte
 
-	// OneTimeJobs contains raw YAML manifests for Jobs that should be applied
-	// directly by the actuator (not via MR). These are Jobs with
-	// hook-succeeded policy (no before-hook-creation) — they should run once
-	// and stay completed, not be recreated by the GRM every reconcile cycle.
+	// OneTimeJobs contains raw YAML manifests for hook Jobs. The actuator
+	// handles these based on render context:
+	// - Seed renders: applied directly with completion wait (ordering control)
+	// - Shoot renders: added to MRData with GRM annotations (ignore +
+	//   delete-on-invalid-update) so the GRM creates once and handles
+	//   chart upgrades via delete+recreate on immutable field errors.
 	OneTimeJobs [][]byte
 
-	// OneTimeResources contains raw YAML manifests for non-Job hook resources
-	// (Secrets, ServiceAccounts, RBAC) that should be applied once and not
-	// re-applied on subsequent reconciles. This prevents the GRM from
-	// overwriting resources that were populated by hook Jobs (e.g., a
-	// placeholder Secret that gets filled with real data by a registration Job).
-	OneTimeResources [][]byte
+	// HookSecrets contains raw YAML manifests for hook Secret resources.
+	// These are ALSO included in MRData with resources.gardener.cloud/ignore
+	// so the GRM creates them once and never overwrites Job-populated data.
+	// The actuator uses this list on seed renders to apply Secrets directly
+	// before Jobs (ordering: Secret must exist before Job writes to it).
+	HookSecrets [][]byte
 }
 
 // HookAwareRenderer renders Helm charts including hook-annotated templates.
@@ -183,7 +185,7 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 	var preDeleteHooks [][]byte
 	var postDeleteHooks [][]byte
 	var oneTimeJobs [][]byte
-	var oneTimeResources [][]byte
+	var hookSecrets [][]byte
 
 	for _, hook := range hooks {
 		hookTypes := classifyHook(hook)
@@ -232,13 +234,18 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 			continue
 		}
 
-		// Hook Secrets are one-time resources — they may be populated
-		// by hook Jobs after creation (e.g., a connector registration
-		// Job writes credentials into an initially empty Secret). If
-		// included in the MR, the GRM would overwrite the populated
-		// data with the empty template version on every reconcile.
+		// Hook Secrets get the GRM ignore annotation so they are created
+		// once and never overwritten. Hook Jobs may populate them with
+		// real data after creation (e.g., connector registration writes
+		// credentials into an initially empty Secret). Also saved in
+		// HookSecrets for seed-render direct application (ordering).
 		if isHookSecret(content) {
-			oneTimeResources = append(oneTimeResources, []byte(content))
+			annotated := string(InjectGRMIgnoreAnnotations([]byte(content)))
+			hookSecrets = append(hookSecrets, []byte(content))
+			installHookManifests = append(installHookManifests, releaseutil.Manifest{
+				Name:    hook.Path,
+				Content: annotated,
+			})
 			continue
 		}
 
@@ -283,11 +290,11 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 	}
 
 	return &RenderResult{
-		MRData:           mrData,
-		PreDeleteHooks:   preDeleteHooks,
-		PostDeleteHooks:  postDeleteHooks,
-		OneTimeJobs:      oneTimeJobs,
-		OneTimeResources: oneTimeResources,
+		MRData:          mrData,
+		PreDeleteHooks:  preDeleteHooks,
+		PostDeleteHooks: postDeleteHooks,
+		OneTimeJobs:     oneTimeJobs,
+		HookSecrets:     hookSecrets,
 	}, nil
 }
 

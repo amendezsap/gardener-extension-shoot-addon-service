@@ -51,13 +51,16 @@ addons:
 
 **Non-Job, non-Secret resources** (ServiceAccounts, RBAC) are included in the ManagedResource as regular Kubernetes resources. The GRM applies them alongside main chart resources. These are idempotent and safe to re-apply.
 
-**Hook Secrets** are treated as one-time resources. They may be populated by hook Jobs after creation (e.g., a connector registration Job writes credentials into an initially empty Secret). Including them in the MR would cause the GRM to overwrite the populated data with the empty chart template version on every reconcile. On seed renders, they are applied directly with create-or-skip semantics. On shoot renders, they are included in the MR only on first deploy (tracked via `HookResourceHashes` in ProviderStatus).
+**Hook Secrets** are included in the MR with `resources.gardener.cloud/ignore: "true"`. The GRM creates them on first deploy but never updates them afterwards. This prevents the GRM from overwriting data populated by hook Jobs (e.g., a connector registration Job writes credentials into an initially empty Secret). On seed renders, Secrets are also applied directly before Jobs to ensure proper ordering.
 
-**Job resources** are handled differently depending on context:
+**Hook Jobs** are handled differently depending on context:
 
-- **Seed renders** (runtime cluster): Jobs are applied directly by the actuator with deduplication and completion wait. The actuator checks if the Job already exists by comparing a spec hash annotation. Same hash = skip. Different hash (chart upgrade) = delete old + create new. Newly created Jobs are polled for completion (120s timeout) to ensure they finish before the GRM applies dependent Deployments.
+- **Seed renders** (runtime cluster): Jobs are applied directly by the actuator with deduplication and completion wait. Hook Secrets are applied directly first (create-or-skip) to ensure they exist before Jobs run. The actuator checks if the Job already exists by comparing a spec hash annotation. Same hash = skip. Different hash (chart upgrade) = delete old + create new. Newly created Jobs are polled for completion (120s timeout).
 
-- **Shoot renders** (shoot clusters): Jobs are included in the MR only on first deploy or chart upgrade (tracked via `HookJobHashes` in ProviderStatus). On subsequent reconciles, Jobs with unchanged spec hashes are omitted from MRData entirely, preventing the GRM from recreating completed Jobs.
+- **Shoot renders** (shoot clusters via MR): Jobs are included in the MR with GRM annotations:
+  - `resources.gardener.cloud/ignore: "true"` — GRM creates the Job once and never re-applies it (Job spec is immutable, and admission mutations cause perpetual diffs)
+  - `resources.gardener.cloud/delete-on-invalid-update: "true"` — on chart upgrade with a new Job spec, the GRM deletes the old Job and creates the new one
+  - `resources.gardener.cloud/skip-health-check: "true"` — completed/failed Jobs don't block MR health
 
 ### Delete Hooks (pre-delete, post-delete)
 

@@ -391,14 +391,6 @@ metadata:
 			Target:              string(addon.GetTarget()),
 			HasHooks:            addon.Hooks != nil && addon.Hooks.Include,
 		}
-		// Carry forward hook hashes from previous status so the renderer
-		// knows which Jobs/Secrets were already included in the MR.
-		if prevStatus != nil {
-			if prev, ok := prevStatus.Addons[addon.Name]; ok && prev != nil {
-				addonStatus.HookJobHashes = prev.HookJobHashes
-				addonStatus.HookResourceHashes = prev.HookResourceHashes
-			}
-		}
 		newStatus.Addons[addon.Name] = addonStatus
 
 		// Render the addon chart and deploy as ManagedResource
@@ -413,7 +405,7 @@ metadata:
 			}
 		}
 
-		secretData, err := a.renderAddonChart(ctx, log, addon, meta, manifest, configMapValues, addonOverride, addonStatus)
+		secretData, err := a.renderAddonChart(ctx, log, addon, meta, manifest, configMapValues, addonOverride)
 		if err != nil {
 			return fmt.Errorf("failed to render chart for addon %s: %w", addon.Name, err)
 		}
@@ -1125,7 +1117,7 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 			continue
 		}
 
-		secretData, err := a.renderAddonChart(ctx, log, addon, meta, manifest, configMapValues, nil, nil)
+		secretData, err := a.renderAddonChart(ctx, log, addon, meta, manifest, configMapValues, nil)
 		if err != nil {
 			log.Error(err, "Failed to render seed addon chart", "addon", addon.Name)
 			continue
@@ -1945,7 +1937,7 @@ data:
 //
 //	{{ .Region }}   -> meta.Region
 //	{{ .SeedName }} -> meta.SeedName
-func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon *addonpkg.Addon, meta *shootMetadata, manifest *addonpkg.AddonManifest, configMapValues map[string]string, perShootOverride *config.AddonOverride, addonStatus *config.AddonStatus) (map[string][]byte, error) {
+func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon *addonpkg.Addon, meta *shootMetadata, manifest *addonpkg.AddonManifest, configMapValues map[string]string, perShootOverride *config.AddonOverride) (map[string][]byte, error) {
 	merged := map[string]interface{}{}
 
 	if configMapValues != nil {
@@ -2040,7 +2032,7 @@ func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon 
 	// captures delete hooks separately.
 	if addon.Hooks != nil && addon.Hooks.Include {
 		isSeedRender := meta.ClusterRole == "runtime"
-		return a.renderAddonChartWithHooks(ctx, log, addon, releaseName, ns, meta.ControlNamespace, isSeedRender, merged, addonStatus)
+		return a.renderAddonChartWithHooks(ctx, log, addon, releaseName, ns, meta.ControlNamespace, isSeedRender, merged)
 	}
 
 	// Standard rendering path: Gardener chartrenderer (hooks silently dropped)
@@ -2076,7 +2068,7 @@ func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon 
 // renderAddonChartWithHooks uses the hook-aware renderer to include Helm
 // hook-annotated templates. Delete hooks are stored in a separate secret
 // for execution during addon removal.
-func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logger, addon *addonpkg.Addon, releaseName, namespace, controlPlaneNamespace string, isSeedRender bool, values map[string]interface{}, addonStatus *config.AddonStatus) (map[string][]byte, error) {
+func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logger, addon *addonpkg.Addon, releaseName, namespace, controlPlaneNamespace string, isSeedRender bool, values map[string]interface{}) (map[string][]byte, error) {
 	disc, err := discovery.NewDiscoveryClientForConfig(a.restConfig)
 	if err != nil {
 		return nil, fmt.Errorf("create discovery client: %w", err)
@@ -2127,132 +2119,68 @@ func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logge
 		a.persistDeleteHooks(ctx, log, controlPlaneNamespace, addon.Name, result.PreDeleteHooks, result.PostDeleteHooks)
 	}
 
-	// One-time Jobs handling depends on render context:
-	// - Seed renders: apply directly to the runtime cluster (we have access)
-	// - Shoot renders: include in MR data only on first deploy or chart upgrade
-	if len(result.OneTimeJobs) > 0 {
-		if isSeedRender {
-			// Direct application on the runtime — skip if Job already exists
-			a.applyOneTimeJobs(ctx, log, a.restConfig, namespace, addon.Name, result.OneTimeJobs)
-		} else {
-			// Shoot renders: include Jobs in MR only if they haven't been
-			// included before (or the spec changed). The GRM recreates Jobs
-			// every ~60s because admission mutations cause diffs on immutable
-			// spec fields. By omitting already-deployed Jobs from the MR,
-			// the GRM has nothing to reconcile.
-			prevHashes := map[string]string{}
-			if addonStatus != nil && addonStatus.HookJobHashes != nil {
-				prevHashes = addonStatus.HookJobHashes
-			}
-			newHashes := map[string]string{}
-
-			for i, jobYAML := range result.OneTimeJobs {
-				// Parse to get the Job name for tracking
-				objs, err := parseManifest(jobYAML)
-				if err != nil {
-					log.Info("Failed to parse hook Job for tracking", "addon", addon.Name, "error", err)
-					continue
-				}
-				for _, obj := range objs {
-					if obj.GetKind() != "Job" {
-						continue
-					}
-					jobName := obj.GetName()
-					specHash := fmt.Sprintf("%x", sha256.Sum256(jobYAML))[:16]
-					newHashes[jobName] = specHash
-
-					if prevHash, ok := prevHashes[jobName]; ok && prevHash == specHash {
-						// Job was already included in a previous MR — skip it.
-						// The GRM already created it; re-including it would
-						// cause perpetual recreations.
-						log.Info("Hook Job already deployed, omitting from MR", "addon", addon.Name, "job", jobName)
-						continue
-					}
-
-					// First deploy or chart upgrade — include in MR
-					key := fmt.Sprintf("hook-job-%s-%d.yaml", addon.Name, i)
-					result.MRData[key] = jobYAML
-					log.Info("Including hook Job in MR", "addon", addon.Name, "job", jobName)
-				}
-			}
-
-			// Update addon status with current hashes for next reconcile
-			if addonStatus != nil {
-				addonStatus.HookJobHashes = newHashes
-			}
+	// Hook resource handling depends on render context:
+	//
+	// Seed renders: apply Secrets directly (create-or-skip) FIRST for
+	// ordering, then apply Jobs directly with completion wait. The MR
+	// also contains the hook Secrets (with ignore annotation) so the GRM
+	// tracks them for lifecycle management but never overwrites them.
+	//
+	// Shoot renders: everything is in the MR. Hook Secrets already have
+	// the ignore annotation (set by renderer). Hook Jobs get ignore +
+	// delete-on-invalid-update annotations here. The GRM applies
+	// resources in kind order (Secrets → Jobs → Deployments), providing
+	// correct ordering naturally.
+	if isSeedRender {
+		// Apply hook Secrets directly BEFORE Jobs — Jobs may write to
+		// these Secrets and need them to exist first.
+		if len(result.HookSecrets) > 0 {
+			a.applyHookSecrets(ctx, log, a.restConfig, namespace, addon.Name, result.HookSecrets)
 		}
-	}
-
-	// One-time hook resources (Secrets) — same pattern as Jobs.
-	// On seed: apply directly (idempotent). On shoot: include in MR once,
-	// then omit to prevent the GRM from overwriting Job-populated data.
-	if len(result.OneTimeResources) > 0 {
-		if isSeedRender {
-			a.applyOneTimeResources(ctx, log, a.restConfig, namespace, addon.Name, result.OneTimeResources)
-		} else {
-			prevHashes := map[string]string{}
-			if addonStatus != nil && addonStatus.HookResourceHashes != nil {
-				prevHashes = addonStatus.HookResourceHashes
-			}
-			newHashes := map[string]string{}
-
-			for i, resYAML := range result.OneTimeResources {
-				objs, err := parseManifest(resYAML)
-				if err != nil {
-					log.Info("Failed to parse hook resource for tracking", "addon", addon.Name, "error", err)
-					continue
-				}
-				for _, obj := range objs {
-					resKey := obj.GetKind() + "/" + obj.GetName()
-					specHash := fmt.Sprintf("%x", sha256.Sum256(resYAML))[:16]
-					newHashes[resKey] = specHash
-
-					if prevHash, ok := prevHashes[resKey]; ok && prevHash == specHash {
-						log.Info("Hook resource already deployed, omitting from MR", "addon", addon.Name, "resource", resKey)
-						continue
-					}
-
-					key := fmt.Sprintf("hook-resource-%s-%d.yaml", addon.Name, i)
-					result.MRData[key] = resYAML
-					log.Info("Including hook resource in MR", "addon", addon.Name, "resource", resKey)
-				}
-			}
-
-			if addonStatus != nil {
-				addonStatus.HookResourceHashes = newHashes
-			}
+		// Apply Jobs directly with spec-hash dedup and completion wait
+		if len(result.OneTimeJobs) > 0 {
+			a.applyOneTimeJobs(ctx, log, a.restConfig, namespace, addon.Name, result.OneTimeJobs)
+		}
+	} else {
+		// Shoot renders: add Jobs to MR with GRM annotations.
+		// Hook Secrets are already in MRData with ignore annotation
+		// (injected by the renderer).
+		for i, jobYAML := range result.OneTimeJobs {
+			key := fmt.Sprintf("hook-job-%s-%d.yaml", addon.Name, i)
+			result.MRData[key] = hookaware.InjectGRMJobAnnotations(jobYAML)
 		}
 	}
 
 	return result.MRData, nil
 }
 
-// applyOneTimeResources applies non-Job hook resources (Secrets) directly
-// to the cluster. Uses create-or-skip semantics — if the resource already
-// exists, it is NOT updated, preserving data written by hook Jobs.
-func (a *actuator) applyOneTimeResources(ctx context.Context, log logr.Logger, restConfig *rest.Config, namespace, addonName string, resources [][]byte) {
+// applyHookSecrets applies hook Secret resources directly to the cluster
+// with create-or-skip semantics. If the Secret already exists, it is NOT
+// updated — preserving data written by hook Jobs. Called on seed renders
+// before applyOneTimeJobs to ensure proper ordering.
+func (a *actuator) applyHookSecrets(ctx context.Context, log logr.Logger, restConfig *rest.Config, namespace, addonName string, secrets [][]byte) {
 	directClient, err := client.New(restConfig, client.Options{})
 	if err != nil {
-		log.Info("Failed to create direct client for hook resources", "addon", addonName, "error", err)
+		log.Info("Failed to create direct client for hook Secrets", "addon", addonName, "error", err)
 		return
 	}
 
-	for _, resYAML := range resources {
-		objs, err := parseManifest(resYAML)
+	for _, secretYAML := range secrets {
+		objs, err := parseManifest(secretYAML)
 		if err != nil {
-			log.Info("Failed to parse hook resource manifest", "addon", addonName, "error", err)
+			log.Info("Failed to parse hook Secret manifest", "addon", addonName, "error", err)
 			continue
 		}
 		for _, obj := range objs {
 			obj.SetNamespace(namespace)
 			if err := directClient.Create(ctx, obj); err != nil {
 				if apierrors.IsAlreadyExists(err) {
-					log.Info("Hook resource already exists, skipping", "addon", addonName, "kind", obj.GetKind(), "name", obj.GetName())
+					log.Info("Hook Secret already exists, skipping", "addon", addonName, "name", obj.GetName())
 				} else {
-					log.Info("Failed to create hook resource", "addon", addonName, "kind", obj.GetKind(), "name", obj.GetName(), "error", err)
+					log.Info("Failed to create hook Secret", "addon", addonName, "name", obj.GetName(), "error", err)
 				}
 			} else {
-				log.Info("Created hook resource", "addon", addonName, "kind", obj.GetKind(), "name", obj.GetName())
+				log.Info("Created hook Secret", "addon", addonName, "name", obj.GetName())
 			}
 		}
 	}

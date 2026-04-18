@@ -104,7 +104,10 @@ When an addon is removed from the manifest, the extension automatically:
 
 **For seed addons:**
 - Compares current manifest against `seed-addon-state` ConfigMap in the extension namespace
-- Deletes seed ManagedResources for removed addons
+- Executes pre-delete hooks from persisted Secret (same as shoot path)
+- Deletes seed ManagedResources for removed addons (hook Secrets survive via `keep-object`)
+- Executes post-delete hooks
+- Cleans up kept hook Secrets and delete hooks Secret
 - Updates the state ConfigMap
 
 ## Hook Annotations

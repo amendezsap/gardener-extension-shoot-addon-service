@@ -1063,6 +1063,11 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 		return
 	}
 
+	extensionNS := getExtensionNamespace()
+	if extensionNS == "" {
+		extensionNS = namespace
+	}
+
 	region := os.Getenv("REGION")
 	if region == "" {
 		region = "us-east-1"
@@ -1093,6 +1098,13 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 		ProviderType:              seedProvider,
 		ClusterRole:               "runtime",
 		ManagedKubernetesProvider: managedK8s,
+		ControlNamespace:          extensionNS,
+	}
+
+	// Ensure ControlNamespace is set for delete hook persistence.
+	// Without it, persistDeleteHooks fails with "empty namespace".
+	if meta.ControlNamespace == "" {
+		meta.ControlNamespace = namespace
 	}
 
 	// Render all seed addon charts first, then hash the rendered output.
@@ -1182,8 +1194,15 @@ metadata:
 		currentSeedMRNames[r.mrName] = true
 	}
 
+	// Build MR name → addon name mapping for state tracking.
+	// cleanupRemovedSeedAddons needs addon names to find persisted delete hooks.
+	currentSeedAddonMap := make(map[string]string, len(rendered))
+	for _, r := range rendered {
+		currentSeedAddonMap[r.mrName] = r.addon.Name
+	}
+
 	// Detect and clean up removed seed addons via ConfigMap state.
-	a.cleanupRemovedSeedAddons(ctx, log, namespace, currentSeedMRNames)
+	a.cleanupRemovedSeedAddons(ctx, log, namespace, targetNS, currentSeedAddonMap)
 
 	log.Info("Seed addon reconciliation complete")
 }
@@ -1199,50 +1218,84 @@ metadata:
 const seedAddonStateCMName = "seed-addon-state"
 
 // cleanupRemovedSeedAddons compares the current set of seed addon MR names
-// against the previously stored set (in a ConfigMap). Deletes MRs for any
-// addons that were removed from the manifest.
-func (a *actuator) cleanupRemovedSeedAddons(ctx context.Context, log logr.Logger, namespace string, currentMRNames map[string]bool) {
+// against the previously stored set (in a ConfigMap). For removed addons:
+// runs delete hooks, deletes the seed MR, then cleans up kept Secrets.
+//
+// The ConfigMap stores mrName=addonName mappings so we can find persisted
+// delete hooks by addon name.
+func (a *actuator) cleanupRemovedSeedAddons(ctx context.Context, log logr.Logger, namespace, targetNamespace string, currentAddonMap map[string]string) {
 	extensionNS := getExtensionNamespace()
 	if extensionNS == "" {
 		extensionNS = namespace // fallback
 	}
 
-	// Read previous state
+	// Read previous state (mrName=addonName mappings)
 	cm := &corev1.ConfigMap{}
 	cmKey := types.NamespacedName{Name: seedAddonStateCMName, Namespace: extensionNS}
-	previousMRNames := map[string]bool{}
+	previousAddonMap := map[string]string{} // mrName → addonName
 
 	if err := a.client.Get(ctx, cmKey, cm); err == nil {
-		if data, ok := cm.Data["mrNames"]; ok {
-			for _, name := range strings.Split(data, ",") {
-				name = strings.TrimSpace(name)
-				if name != "" {
-					previousMRNames[name] = true
+		if data, ok := cm.Data["addonMappings"]; ok {
+			for _, entry := range strings.Split(data, ",") {
+				parts := strings.SplitN(strings.TrimSpace(entry), "=", 2)
+				if len(parts) == 2 && parts[0] != "" {
+					previousAddonMap[parts[0]] = parts[1]
+				}
+			}
+		}
+		// Backwards compatibility: read old format (mrNames only)
+		if len(previousAddonMap) == 0 {
+			if data, ok := cm.Data["mrNames"]; ok {
+				for _, name := range strings.Split(data, ",") {
+					name = strings.TrimSpace(name)
+					if name != "" {
+						previousAddonMap[name] = "" // no addon name available
+					}
 				}
 			}
 		}
 	}
 
 	// Detect removals: in previous but not in current
-	for mrName := range previousMRNames {
-		if currentMRNames[mrName] {
+	for mrName, addonName := range previousAddonMap {
+		if _, exists := currentAddonMap[mrName]; exists {
 			continue
 		}
-		log.Info("Seed addon removed, deleting MR", "managedResource", mrName)
+
+		log.Info("Seed addon removed, cleaning up", "managedResource", mrName, "addon", addonName)
+
+		// Run pre-delete hooks if addon name is known and hooks exist.
+		// The delete hooks Secret is in the extension namespace (where
+		// persistDeleteHooks stores it during install).
+		if addonName != "" {
+			if err := a.executeDeleteHooks(ctx, log, extensionNS, targetNamespace, addonName, "pre-delete", 60); err != nil {
+				log.Info("Seed pre-delete hook failed, continuing", "addon", addonName, "error", err)
+			}
+		}
+
+		// Delete the seed MR
 		if err := managedresources.DeleteForSeed(ctx, a.client, namespace, mrName); err != nil {
 			log.Info("Failed to delete removed seed addon MR", "managedResource", mrName, "error", err)
 		}
+
+		// Run post-delete hooks and clean up kept Secrets
+		if addonName != "" {
+			if err := a.executeDeleteHooks(ctx, log, extensionNS, targetNamespace, addonName, "post-delete", 60); err != nil {
+				log.Info("Seed post-delete hook failed, continuing", "addon", addonName, "error", err)
+			}
+			a.cleanupKeptHookSecrets(ctx, log, extensionNS, targetNamespace, addonName)
+		}
 	}
 
-	// Write current state
-	var mrNameList []string
-	for name := range currentMRNames {
-		mrNameList = append(mrNameList, name)
+	// Write current state as mrName=addonName mappings
+	var entries []string
+	for mrName, addonName := range currentAddonMap {
+		entries = append(entries, mrName+"="+addonName)
 	}
-	sort.Strings(mrNameList)
+	sort.Strings(entries)
 
 	cmData := map[string]string{
-		"mrNames": strings.Join(mrNameList, ","),
+		"addonMappings": strings.Join(entries, ","),
 	}
 
 	if cm.Name == "" {

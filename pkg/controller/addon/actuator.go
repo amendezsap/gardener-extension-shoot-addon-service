@@ -180,19 +180,21 @@ func (a *actuator) Reconcile(ctx context.Context, log logr.Logger, ex *extension
 		return nil
 	}
 
+	prevStatus, err := config.GetPreviousStatus(ex)
+	if err != nil {
+		log.Error(err, "Failed to parse previous status, treating as empty")
+		prevStatus = &config.ProviderStatus{}
+	}
+
 	// Deploy seed-targeted addons when manifest changes.
-	a.reconcileSeedAddons(ctx, log, ex.Namespace, meta.ProviderType, manifest, configMapValues)
+	// Pass prevStatus so seed cleanup can skip delete hooks for addons
+	// that also have shoot-class MRs (the shoot removal path handles them).
+	a.reconcileSeedAddons(ctx, log, ex.Namespace, meta.ProviderType, manifest, configMapValues, prevStatus)
 
 	// Resolve per-shoot config from the Extension CR's providerConfig
 	cfg, err := config.ResolveConfig(ex)
 	if err != nil {
 		return fmt.Errorf("failed to resolve config: %w", err)
-	}
-
-	prevStatus, err := config.GetPreviousStatus(ex)
-	if err != nil {
-		log.Error(err, "Failed to parse previous status, treating as empty")
-		prevStatus = &config.ProviderStatus{}
 	}
 
 	log = log.WithValues("shoot", meta.Name, "namespace", meta.Namespace, "nodeRole", meta.NodeRoleName)
@@ -459,7 +461,7 @@ metadata:
 			// Execute pre-delete hooks on the shoot via temporary MR.
 			// Removed addons have no hook config, so use 60s timeout and always continue.
 			if addonStatus.HasHooks {
-				if err := a.executeShootDeleteHooks(ctx, log, ex.Namespace, addonName, "pre-delete", 60); err != nil {
+				if err := a.executeShootDeleteHooks(ctx, log, ex.Namespace, addonName, "pre-delete", 120); err != nil {
 					log.Info("Pre-delete hook failed for removed addon, continuing", "addon", addonName, "error", err)
 				}
 			}
@@ -485,7 +487,7 @@ metadata:
 
 			// Execute post-delete hooks on the shoot, then clean up
 			if addonStatus.HasHooks {
-				if err := a.executeShootDeleteHooks(ctx, log, ex.Namespace, addonName, "post-delete", 60); err != nil {
+				if err := a.executeShootDeleteHooks(ctx, log, ex.Namespace, addonName, "post-delete", 120); err != nil {
 					log.Info("Post-delete hook failed for removed addon, continuing", "addon", addonName, "error", err)
 				}
 
@@ -1033,7 +1035,7 @@ func getExtensionNamespace() string {
 // reconcileSeedAddons deploys addons with target "seed" or "global" to the
 // seed/runtime cluster as seed-class ManagedResources. Uses hash-based change
 // detection to redeploy when the manifest changes (e.g., ConfigMap update).
-func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, namespace string, providerType string, manifest *addonpkg.AddonManifest, configMapValues map[string]string) {
+func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, namespace string, providerType string, manifest *addonpkg.AddonManifest, configMapValues map[string]string, prevStatus *config.ProviderStatus) {
 	// On managed seeds, the parent seed's extension already deploys addons via
 	// shoot-class ManagedResources into the shoot cluster (which IS the managed
 	// seed). Skip seed addon deployment to avoid duplicates.
@@ -1207,7 +1209,7 @@ metadata:
 	}
 
 	// Detect and clean up removed seed addons via ConfigMap state.
-	a.cleanupRemovedSeedAddons(ctx, log, namespace, targetNS, currentSeedAddonMap)
+	a.cleanupRemovedSeedAddons(ctx, log, namespace, targetNS, currentSeedAddonMap, prevStatus)
 
 	log.Info("Seed addon reconciliation complete")
 }
@@ -1228,7 +1230,7 @@ const seedAddonStateCMName = "seed-addon-state"
 //
 // The ConfigMap stores mrName=addonName mappings so we can find persisted
 // delete hooks by addon name.
-func (a *actuator) cleanupRemovedSeedAddons(ctx context.Context, log logr.Logger, namespace, targetNamespace string, currentAddonMap map[string]string) {
+func (a *actuator) cleanupRemovedSeedAddons(ctx context.Context, log logr.Logger, namespace, targetNamespace string, currentAddonMap map[string]string, prevStatus *config.ProviderStatus) {
 	extensionNS := getExtensionNamespace()
 	if extensionNS == "" {
 		extensionNS = namespace // fallback
@@ -1269,10 +1271,18 @@ func (a *actuator) cleanupRemovedSeedAddons(ctx context.Context, log logr.Logger
 
 		log.Info("Seed addon removed, cleaning up", "managedResource", mrName, "addon", addonName)
 
-		// Run pre-delete hooks if addon name is known and hooks exist.
-		// The delete hooks Secret is in the extension namespace (where
-		// persistDeleteHooks stores it during install).
-		if addonName != "" {
+		// Check if this addon also has a shoot-class MR (target: global).
+		// If so, the shoot removal path handles delete hooks — skip here
+		// to avoid double execution (e.g., deregistering a connector twice).
+		shootPathHandlesHooks := false
+		if addonName != "" && prevStatus != nil {
+			if _, inShootStatus := prevStatus.Addons[addonName]; inShootStatus {
+				shootPathHandlesHooks = true
+			}
+		}
+
+		// Run delete hooks only for seed-only addons (not tracked in shoot status).
+		if addonName != "" && !shootPathHandlesHooks {
 			if err := a.executeDeleteHooks(ctx, log, extensionNS, targetNamespace, addonName, "pre-delete", 60); err != nil {
 				log.Info("Seed pre-delete hook failed, continuing", "addon", addonName, "error", err)
 			}
@@ -1283,12 +1293,17 @@ func (a *actuator) cleanupRemovedSeedAddons(ctx context.Context, log logr.Logger
 			log.Info("Failed to delete removed seed addon MR", "managedResource", mrName, "error", err)
 		}
 
-		// Run post-delete hooks and clean up the persisted hooks Secret
-		if addonName != "" {
+		// Run post-delete hooks for seed-only addons
+		if addonName != "" && !shootPathHandlesHooks {
 			if err := a.executeDeleteHooks(ctx, log, extensionNS, targetNamespace, addonName, "post-delete", 60); err != nil {
 				log.Info("Seed post-delete hook failed, continuing", "addon", addonName, "error", err)
 			}
-			// Delete the persisted delete hooks Secret
+		}
+
+		// Clean up the persisted delete hooks Secret in the extension namespace.
+		// For global addons, the shoot path has its own copy in the shoot CP
+		// namespace — this just cleans the seed-side copy.
+		if addonName != "" {
 			hookSecret := &corev1.Secret{}
 			hookSecretKey := types.NamespacedName{
 				Name:      deleteHookSecretName(addonName),
@@ -2449,7 +2464,7 @@ func (a *actuator) executeShootDeleteHooks(ctx context.Context, log logr.Logger,
 	}
 
 	if timeout <= 0 {
-		timeout = 60
+		timeout = 120
 	}
 
 	// Create temporary shoot-class MR
@@ -2504,8 +2519,10 @@ func (a *actuator) executeShootDeleteHooks(ctx context.Context, log logr.Logger,
 		log.Info("Shoot delete hook timed out", "addon", addonName, "hookType", hookType, "timeout", timeout)
 	}
 
-	// Delete the temporary MR — GRM cleans up hook resources from the shoot
-	if err := a.deleteManagedResource(ctx, controlPlaneNamespace, mrName); err != nil {
+	// Delete the temporary MR (fire-and-forget). Don't use deleteManagedResource
+	// which calls WaitUntilDeleted and blocks until GRM fully processes the
+	// deletion. The GRM cleans up hook resources from the shoot in the background.
+	if err := managedresources.DeleteForShoot(ctx, a.client, controlPlaneNamespace, mrName); err != nil {
 		log.Info("Failed to delete temporary delete hook MR", "addon", addonName, "error", err)
 	}
 

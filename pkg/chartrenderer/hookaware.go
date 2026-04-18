@@ -234,14 +234,13 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 			continue
 		}
 
-		// Hook Secrets get GRM annotations:
-		// - ignore: created once, never overwritten (preserves Job-populated data)
-		// - keep-object: survives MR deletion so delete hook Jobs can still
-		//   mount them (e.g., wiz-api-token needed for connector deregistration)
-		// The extension cleans them up after delete hooks complete.
+		// Hook Secrets get the GRM ignore annotation so they are created
+		// once and never overwritten. Hook Jobs may populate them with
+		// real data after creation (e.g., connector registration writes
+		// credentials into an initially empty Secret).
 		// Also saved in HookSecrets for seed-render direct application (ordering).
 		if isHookSecret(content) {
-			annotated := string(InjectGRMHookSecretAnnotations([]byte(content)))
+			annotated := string(InjectGRMIgnoreAnnotations([]byte(content)))
 			hookSecrets = append(hookSecrets, []byte(content))
 			installHookManifests = append(installHookManifests, releaseutil.Manifest{
 				Name:    hook.Path,

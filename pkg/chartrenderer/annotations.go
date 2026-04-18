@@ -92,18 +92,6 @@ func InjectGRMIgnoreAnnotations(manifest []byte) []byte {
 	})
 }
 
-// InjectGRMHookSecretAnnotations adds annotations for hook Secrets in the MR:
-//   - ignore: GRM creates once, never overwrites Job-populated data
-//   - keep-object: Secret survives MR deletion so delete hook Jobs can still
-//     mount it (e.g., wiz-api-token for connector deregistration). The
-//     extension cleans up kept Secrets after delete hooks complete.
-func InjectGRMHookSecretAnnotations(manifest []byte) []byte {
-	return injectAnnotations(manifest, map[string]string{
-		"resources.gardener.cloud/ignore":      "true",
-		"resources.gardener.cloud/keep-object": "true",
-	})
-}
-
 // InjectGRMJobAnnotations adds annotations for hook Jobs in the MR:
 //   - ignore: GRM creates the Job once and never re-applies it (Job spec is
 //     immutable, and admission mutations cause perpetual diffs)

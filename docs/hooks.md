@@ -68,20 +68,27 @@ The extension cleans up kept Secrets after delete hooks complete. Hook Secret na
 
 ### Delete Hooks (pre-delete, post-delete)
 
-Delete hooks are **persisted in a Kubernetes Secret** (`addon-delete-hooks-<addonName>`) in the shoot's control-plane namespace. This survives pod restarts and is available even after the addon is removed from the manifest.
+Delete hooks are **persisted in a Kubernetes Secret** (`addon-delete-hooks-<addonName>`) in the control-plane namespace. This survives pod restarts and is available even after the addon is removed from the manifest.
+
+Delete hook execution differs by render context:
+
+**Shoot renders**: Delete hooks are applied via a **temporary shoot-class MR**. The GRM applies the hook resources (SA, Role, RoleBinding, Job) to the shoot cluster — where the addon's Secrets exist. The extension polls MR status (`ResourcesHealthy`) for Job completion and deletes the temporary MR afterwards. This is necessary because the extension cannot access shoot clusters directly.
+
+**Seed renders**: Delete hooks are applied directly to the runtime cluster using an uncached client (same as install hooks).
 
 Delete hooks execute in two scenarios:
 
 **1. Extension deletion** (shoot removed):
-- Pre-delete hooks run before MR deletion
-- Post-delete hooks run after MR deletion
+- Pre-delete hooks run before MR deletion (via temporary shoot MR)
+- MR deleted
+- Post-delete hooks run after MR deletion (via temporary shoot MR)
 
 **2. Addon removal** (addon removed from manifest):
 - The extension detects removed addons by diffing current manifest against previous ProviderStatus
-- Pre-delete hooks are read from the persisted Secret and applied
-- Shoot and seed MRs are deleted
+- Pre-delete hooks run (shoot: temporary MR, seed: direct application)
+- Addon MR deleted
 - Post-delete hooks run
-- The hook Secret is cleaned up
+- Persisted delete hooks Secret cleaned up
 
 If a delete hook Job fails or times out, behavior depends on `deleteFailurePolicy`:
 - `Continue` (default): logs the failure and proceeds with deletion
@@ -97,17 +104,17 @@ When an addon is removed from the manifest, the extension automatically:
 
 **For shoot addons:**
 - Compares current manifest against `ProviderStatus.Addons` (tracks deployed addons)
-- Executes pre-delete hooks from persisted Secret
+- Executes pre-delete hooks on the shoot via temporary MR
 - Deletes the shoot ManagedResource
-- Executes post-delete hooks
-- Cleans up hook and state Secrets
+- Executes post-delete hooks on the shoot via temporary MR
+- Cleans up persisted delete hooks Secret
 
 **For seed addons:**
 - Compares current manifest against `seed-addon-state` ConfigMap in the extension namespace
-- Executes pre-delete hooks from persisted Secret (same as shoot path)
-- Deletes seed ManagedResources for removed addons (hook Secrets survive via `keep-object`)
-- Executes post-delete hooks
-- Cleans up kept hook Secrets and delete hooks Secret
+- Executes pre-delete hooks directly on the runtime
+- Deletes seed ManagedResources for removed addons
+- Executes post-delete hooks directly on the runtime
+- Cleans up persisted delete hooks Secret
 - Updates the state ConfigMap
 
 ## Hook Annotations

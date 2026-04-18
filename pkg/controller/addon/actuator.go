@@ -456,10 +456,10 @@ metadata:
 
 			log.Info("Addon removed from manifest, cleaning up", "addon", addonName)
 
-			// Execute pre-delete hooks if the addon had hooks.
+			// Execute pre-delete hooks on the shoot via temporary MR.
 			// Removed addons have no hook config, so use 60s timeout and always continue.
 			if addonStatus.HasHooks {
-				if err := a.executeDeleteHooks(ctx, log, ex.Namespace, manifest.DefaultNamespace, addonName, "pre-delete", 60); err != nil {
+				if err := a.executeShootDeleteHooks(ctx, log, ex.Namespace, addonName, "pre-delete", 60); err != nil {
 					log.Info("Pre-delete hook failed for removed addon, continuing", "addon", addonName, "error", err)
 				}
 			}
@@ -483,15 +483,23 @@ metadata:
 				}
 			}
 
-			// Execute post-delete hooks
+			// Execute post-delete hooks on the shoot, then clean up
 			if addonStatus.HasHooks {
-				if err := a.executeDeleteHooks(ctx, log, ex.Namespace, manifest.DefaultNamespace, addonName, "post-delete", 60); err != nil {
+				if err := a.executeShootDeleteHooks(ctx, log, ex.Namespace, addonName, "post-delete", 60); err != nil {
 					log.Info("Post-delete hook failed for removed addon, continuing", "addon", addonName, "error", err)
 				}
 
-				// Clean up hook Secrets that survived MR deletion (keep-object),
-				// then delete the delete hooks Secret itself.
-				a.cleanupKeptHookSecrets(ctx, log, ex.Namespace, manifest.DefaultNamespace, addonName)
+				// Delete the persisted delete hooks Secret
+				hookSecret := &corev1.Secret{}
+				hookSecretKey := types.NamespacedName{
+					Name:      deleteHookSecretName(addonName),
+					Namespace: ex.Namespace,
+				}
+				if err := a.client.Get(ctx, hookSecretKey, hookSecret); err == nil {
+					if err := a.client.Delete(ctx, hookSecret); err != nil {
+						log.Info("Failed to delete hook Secret for removed addon", "addon", addonName, "error", err)
+					}
+				}
 			}
 		}
 	}
@@ -558,13 +566,12 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 	// Collect errors so all cleanup steps run even if some fail
 	var errs []error
 
-	// 0. Execute pre-delete hooks for addons that have them.
+	// 0. Execute pre-delete hooks on the shoot via temporary MR.
 	// If deleteFailurePolicy is "Abort" and a hook fails, addon removal is blocked.
-	targetNS := manifest.DefaultNamespace
 	for i := range manifest.Addons {
 		addon := &manifest.Addons[i]
 		if addon.Hooks != nil && addon.Hooks.Include {
-			if err := a.executeDeleteHooks(ctx, log, ex.Namespace, targetNS, addon.Name, "pre-delete", addon.Hooks.GetDeleteTimeout()); err != nil {
+			if err := a.executeShootDeleteHooks(ctx, log, ex.Namespace, addon.Name, "pre-delete", addon.Hooks.GetDeleteTimeout()); err != nil {
 				if addon.Hooks.ShouldAbortOnDeleteFailure() {
 					return fmt.Errorf("pre-delete hook failed for addon %s (policy: Abort): %w", addon.Name, err)
 				}
@@ -584,19 +591,17 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 		}
 	}
 
-	// 1a. Execute post-delete hooks after MR deletion
+	// 1a. Execute post-delete hooks on the shoot after MR deletion
 	for i := range manifest.Addons {
 		addon := &manifest.Addons[i]
 		if addon.Hooks != nil && addon.Hooks.Include {
-			if err := a.executeDeleteHooks(ctx, log, ex.Namespace, targetNS, addon.Name, "post-delete", addon.Hooks.GetDeleteTimeout()); err != nil {
+			if err := a.executeShootDeleteHooks(ctx, log, ex.Namespace, addon.Name, "post-delete", addon.Hooks.GetDeleteTimeout()); err != nil {
 				if addon.Hooks.ShouldAbortOnDeleteFailure() {
 					errs = append(errs, fmt.Errorf("post-delete hook failed for addon %s: %w", addon.Name, err))
 				} else {
 					log.Info("Post-delete hook failed, continuing (policy: Continue)", "addon", addon.Name, "error", err)
 				}
 			}
-			// Clean up hook Secrets that survived MR deletion (keep-object)
-			a.cleanupKeptHookSecrets(ctx, log, ex.Namespace, targetNS, addon.Name)
 		}
 	}
 
@@ -1278,12 +1283,22 @@ func (a *actuator) cleanupRemovedSeedAddons(ctx context.Context, log logr.Logger
 			log.Info("Failed to delete removed seed addon MR", "managedResource", mrName, "error", err)
 		}
 
-		// Run post-delete hooks and clean up kept Secrets
+		// Run post-delete hooks and clean up the persisted hooks Secret
 		if addonName != "" {
 			if err := a.executeDeleteHooks(ctx, log, extensionNS, targetNamespace, addonName, "post-delete", 60); err != nil {
 				log.Info("Seed post-delete hook failed, continuing", "addon", addonName, "error", err)
 			}
-			a.cleanupKeptHookSecrets(ctx, log, extensionNS, targetNamespace, addonName)
+			// Delete the persisted delete hooks Secret
+			hookSecret := &corev1.Secret{}
+			hookSecretKey := types.NamespacedName{
+				Name:      deleteHookSecretName(addonName),
+				Namespace: extensionNS,
+			}
+			if err := a.client.Get(ctx, hookSecretKey, hookSecret); err == nil {
+				if err := a.client.Delete(ctx, hookSecret); err != nil {
+					log.Info("Failed to delete hook Secret for seed addon", "addon", addonName, "error", err)
+				}
+			}
 		}
 	}
 
@@ -2176,21 +2191,8 @@ func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logge
 	// Persist delete hooks in a Secret for later execution during addon removal.
 	// Stored in the shoot's control-plane namespace so they survive pod restarts
 	// and are available even after the addon is removed from the manifest.
-	// Also persist hook Secret names so the cleanup code knows which Secrets
-	// to delete after delete hooks complete (they have keep-object annotation
-	// and survive MR deletion).
 	if len(result.PreDeleteHooks) > 0 || len(result.PostDeleteHooks) > 0 {
-		var hookSecretNames []string
-		for _, secretYAML := range result.HookSecrets {
-			objs, err := parseManifest(secretYAML)
-			if err != nil {
-				continue
-			}
-			for _, obj := range objs {
-				hookSecretNames = append(hookSecretNames, obj.GetName())
-			}
-		}
-		a.persistDeleteHooks(ctx, log, controlPlaneNamespace, addon.Name, result.PreDeleteHooks, result.PostDeleteHooks, hookSecretNames)
+		a.persistDeleteHooks(ctx, log, controlPlaneNamespace, addon.Name, result.PreDeleteHooks, result.PostDeleteHooks)
 	}
 
 	// Hook resource handling depends on render context:
@@ -2367,56 +2369,10 @@ func deleteHookSecretName(addonName string) string {
 	return "addon-delete-hooks-" + addonName
 }
 
-// cleanupKeptHookSecrets deletes hook Secrets that survived MR deletion
-// (annotated with keep-object) and then deletes the addon-delete-hooks-*
-// Secret itself. Reads hook Secret names from the persisted delete hooks
-// Secret's "hook-secret-names" key.
-func (a *actuator) cleanupKeptHookSecrets(ctx context.Context, log logr.Logger, controlPlaneNamespace, targetNamespace, addonName string) {
-	secretName := deleteHookSecretName(addonName)
-
-	// Read the persisted delete hooks Secret to get hook Secret names
-	secret := &corev1.Secret{}
-	key := types.NamespacedName{Name: secretName, Namespace: controlPlaneNamespace}
-	if err := a.client.Get(ctx, key, secret); err != nil {
-		return // no hooks persisted, nothing to clean up
-	}
-
-	// Delete kept hook Secrets from the target namespace
-	if namesData, ok := secret.Data["hook-secret-names"]; ok && len(namesData) > 0 {
-		names := strings.Split(string(namesData), ",")
-		directClient, err := client.New(a.restConfig, client.Options{})
-		if err != nil {
-			log.Info("Failed to create client for hook Secret cleanup", "addon", addonName, "error", err)
-		} else {
-			for _, name := range names {
-				name = strings.TrimSpace(name)
-				if name == "" {
-					continue
-				}
-				s := &corev1.Secret{}
-				s.Name = name
-				s.Namespace = targetNamespace
-				if err := directClient.Delete(ctx, s); err != nil {
-					if !apierrors.IsNotFound(err) {
-						log.Info("Failed to delete kept hook Secret", "addon", addonName, "secret", name, "error", err)
-					}
-				} else {
-					log.Info("Deleted kept hook Secret", "addon", addonName, "secret", name)
-				}
-			}
-		}
-	}
-
-	// Delete the delete hooks Secret itself
-	if err := a.client.Delete(ctx, secret); err != nil {
-		log.Info("Failed to delete hook Secret", "addon", addonName, "error", err)
-	}
-}
-
 // persistDeleteHooks saves delete hook manifests to a Secret in the shoot's
 // control-plane namespace. Survives pod restarts and is available even after
 // the addon is removed from the manifest.
-func (a *actuator) persistDeleteHooks(ctx context.Context, log logr.Logger, namespace, addonName string, preDelete, postDelete [][]byte, hookSecretNames []string) {
+func (a *actuator) persistDeleteHooks(ctx context.Context, log logr.Logger, namespace, addonName string, preDelete, postDelete [][]byte) {
 	secretName := deleteHookSecretName(addonName)
 
 	data := map[string][]byte{}
@@ -2425,9 +2381,6 @@ func (a *actuator) persistDeleteHooks(ctx context.Context, log logr.Logger, name
 	}
 	if len(postDelete) > 0 {
 		data["post-delete"] = bytes.Join(postDelete, []byte("\n---\n"))
-	}
-	if len(hookSecretNames) > 0 {
-		data["hook-secret-names"] = []byte(strings.Join(hookSecretNames, ","))
 	}
 
 	secret := &corev1.Secret{}
@@ -2455,8 +2408,113 @@ func (a *actuator) persistDeleteHooks(ctx context.Context, log logr.Logger, name
 	}
 }
 
+// executeShootDeleteHooks runs delete hooks on a shoot cluster by creating
+// a temporary shoot-class ManagedResource. The GRM applies the hook resources
+// (SA, Role, RoleBinding, Job) to the shoot — where the addon's Secrets
+// exist. This is necessary because the extension cannot access shoot clusters
+// directly, and delete hooks must run where the chart was deployed.
+//
+// Flow:
+//  1. Read hook manifests from persisted Secret
+//  2. Create temporary shoot-class MR with hook resources
+//  3. Poll MR status until ResourcesHealthy (Job succeeded) or timeout
+//  4. Delete temporary MR (GRM cleans up hook resources from shoot)
+func (a *actuator) executeShootDeleteHooks(ctx context.Context, log logr.Logger, controlPlaneNamespace, addonName string, hookType string, timeout int) error {
+	secretName := deleteHookSecretName(addonName)
+
+	// Read hooks from persisted Secret
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Name: secretName, Namespace: controlPlaneNamespace}
+	if err := a.client.Get(ctx, key, secret); err != nil {
+		return nil // no hooks persisted
+	}
+
+	hookData, ok := secret.Data[hookType]
+	if !ok || len(hookData) == 0 {
+		return nil
+	}
+
+	// Build MR data from hook manifests
+	mrData := map[string][]byte{}
+	docs := bytes.Split(hookData, []byte("\n---\n"))
+	for i, doc := range docs {
+		if len(bytes.TrimSpace(doc)) > 0 {
+			mrKey := fmt.Sprintf("delete-hook-%s-%s-%d.yaml", addonName, hookType, i)
+			mrData[mrKey] = doc
+		}
+	}
+
+	if len(mrData) == 0 {
+		return nil
+	}
+
+	if timeout <= 0 {
+		timeout = 60
+	}
+
+	// Create temporary shoot-class MR
+	mrName := fmt.Sprintf("addon-delete-%s-%s", addonName, hookType)
+	log.Info("Creating shoot-side delete hook MR", "addon", addonName, "hookType", hookType, "managedResource", mrName)
+
+	if err := managedresources.CreateForShoot(ctx, a.client, controlPlaneNamespace, mrName, "shoot-addon-service", false, mrData); err != nil {
+		return fmt.Errorf("create delete hooks MR: %w", err)
+	}
+
+	// Poll MR status for Job completion. GRM health checks report:
+	// - Job succeeded → ResourcesHealthy = True
+	// - Job failed → ResourcesHealthy = False
+	// - Job running → ResourcesProgressing (neither True nor False)
+	var hookErr error
+	deadline := time.Now().Add(time.Duration(timeout) * time.Second)
+
+	for time.Now().Before(deadline) {
+		mr := &resourcesv1alpha1.ManagedResource{}
+		mrKey := types.NamespacedName{Name: mrName, Namespace: controlPlaneNamespace}
+		if err := a.client.Get(ctx, mrKey, mr); err != nil {
+			hookErr = fmt.Errorf("get delete hook MR: %w", err)
+			break
+		}
+
+		var applied, healthy, unhealthy bool
+		for _, cond := range mr.Status.Conditions {
+			switch gardencorev1beta1.ConditionType(cond.Type) {
+			case resourcesv1alpha1.ResourcesApplied:
+				applied = cond.Status == gardencorev1beta1.ConditionTrue
+			case resourcesv1alpha1.ResourcesHealthy:
+				healthy = cond.Status == gardencorev1beta1.ConditionTrue
+				unhealthy = cond.Status == gardencorev1beta1.ConditionFalse
+			}
+		}
+
+		if applied && healthy {
+			log.Info("Shoot delete hook completed", "addon", addonName, "hookType", hookType)
+			break
+		}
+		if applied && unhealthy {
+			hookErr = fmt.Errorf("shoot delete hook Job failed for addon %s", addonName)
+			log.Info("Shoot delete hook failed", "addon", addonName, "hookType", hookType)
+			break
+		}
+
+		time.Sleep(5 * time.Second)
+	}
+
+	if hookErr == nil && time.Now().After(deadline) {
+		hookErr = fmt.Errorf("shoot delete hook timed out after %ds for addon %s", timeout, addonName)
+		log.Info("Shoot delete hook timed out", "addon", addonName, "hookType", hookType, "timeout", timeout)
+	}
+
+	// Delete the temporary MR — GRM cleans up hook resources from the shoot
+	if err := a.deleteManagedResource(ctx, controlPlaneNamespace, mrName); err != nil {
+		log.Info("Failed to delete temporary delete hook MR", "addon", addonName, "error", err)
+	}
+
+	return hookErr
+}
+
 // executeDeleteHooks reads delete hook manifests from the persisted Secret
-// and applies them directly to the cluster. Uses an uncached client. Only
+// and applies them directly to the runtime cluster. Used for seed renders
+// where the extension has direct cluster access. Uses an uncached client. Only
 // waits for Jobs that were actually created during this invocation.
 // The timeout parameter controls how long to wait for Job completion.
 // A timeout of 0 uses the default (60s).

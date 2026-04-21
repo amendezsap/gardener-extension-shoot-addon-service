@@ -92,45 +92,6 @@ func InjectGRMIgnoreAnnotations(manifest []byte) []byte {
 	})
 }
 
-// InjectGRMJobAnnotations prepares a hook Job for inclusion in a persistent
-// ManagedResource:
-//   - ignore: GRM creates the Job once and never re-applies it
-//   - skip-health-check: completed/failed Jobs don't block MR health
-//   - strips ttlSecondsAfterFinished: prevents Kubernetes from deleting the
-//     completed Job, which would cause GRM to recreate it on the next
-//     reconcile (ignore allows creation when resource is NotFound)
-func InjectGRMJobAnnotations(manifest []byte) []byte {
-	var obj map[string]interface{}
-	if err := yaml.Unmarshal(manifest, &obj); err != nil {
-		return manifest
-	}
-
-	// Strip ttlSecondsAfterFinished from spec — completed Jobs must persist
-	// so GRM doesn't recreate them every reconcile cycle.
-	if spec, ok := obj["spec"].(map[string]interface{}); ok {
-		delete(spec, "ttlSecondsAfterFinished")
-	}
-
-	// Add GRM annotations
-	metadata, ok := obj["metadata"].(map[string]interface{})
-	if !ok {
-		metadata = map[string]interface{}{}
-		obj["metadata"] = metadata
-	}
-	annotations, ok := metadata["annotations"].(map[string]interface{})
-	if !ok {
-		annotations = map[string]interface{}{}
-	}
-	annotations["resources.gardener.cloud/ignore"] = "true"
-	annotations["resources.gardener.cloud/skip-health-check"] = "true"
-	metadata["annotations"] = annotations
-
-	out, err := yaml.Marshal(obj)
-	if err != nil {
-		return manifest
-	}
-	return out
-}
 
 func injectAnnotations(manifest []byte, toAdd map[string]string) []byte {
 	var obj map[string]interface{}

@@ -77,6 +77,11 @@ type AddonStatus struct {
 	Target string `json:"target,omitempty"`
 	// HasHooks indicates the addon had hooks.include: true.
 	HasHooks bool `json:"hasHooks,omitempty"`
+	// HookJobsCompleted tracks shoot-side hook Jobs that have been applied
+	// via temporary MR. Key is "hook-job-<addonName>-<index>", value is the
+	// spec hash. On subsequent reconciles, Jobs with unchanged hashes are
+	// skipped. On chart upgrade (different hash), the Job runs again.
+	HookJobsCompleted map[string]string `json:"hookJobsCompleted,omitempty"`
 }
 
 // VPCEndpointStatus tracks VPC endpoint state for an addon.

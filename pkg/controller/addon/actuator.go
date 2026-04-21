@@ -1328,6 +1328,16 @@ func (a *actuator) cleanupRemovedSeedAddons(ctx context.Context, log logr.Logger
 					log.Info("Failed to delete hook Secret for seed addon", "addon", addonName, "error", err)
 				}
 			}
+
+			// Clear seed hook Job hashes for the removed addon.
+			// If re-added later, Jobs will run fresh.
+			a.mu.Lock()
+			for key := range a.seedJobHashes {
+				if strings.HasPrefix(key, addonName+"/") {
+					delete(a.seedJobHashes, key)
+				}
+			}
+			a.mu.Unlock()
 		}
 	}
 

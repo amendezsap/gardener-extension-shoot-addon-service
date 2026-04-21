@@ -408,10 +408,11 @@ metadata:
 			}
 		}
 
-		secretData, err := a.renderAddonChart(ctx, log, addon, meta, manifest, configMapValues, addonOverride)
+		secretData, shootHookJobs, err := a.renderAddonChart(ctx, log, addon, meta, manifest, configMapValues, addonOverride)
 		if err != nil {
 			return fmt.Errorf("failed to render chart for addon %s: %w", addon.Name, err)
 		}
+		_ = shootHookJobs // used in commit 3
 
 		log.Info("Deploying addon ManagedResource", "addon", addon.Name, "managedResource", mrName, "targetNamespace", ns)
 		if err := managedresources.CreateForShoot(ctx, a.client, ex.Namespace, mrName, "shoot-addon-service", false, secretData); err != nil {
@@ -1131,7 +1132,7 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 			continue
 		}
 
-		secretData, err := a.renderAddonChart(ctx, log, addon, meta, manifest, configMapValues, nil)
+		secretData, _, err := a.renderAddonChart(ctx, log, addon, meta, manifest, configMapValues, nil)
 		if err != nil {
 			log.Error(err, "Failed to render seed addon chart", "addon", addon.Name)
 			continue
@@ -2028,7 +2029,7 @@ data:
 //
 //	{{ .Region }}   -> meta.Region
 //	{{ .SeedName }} -> meta.SeedName
-func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon *addonpkg.Addon, meta *shootMetadata, manifest *addonpkg.AddonManifest, configMapValues map[string]string, perShootOverride *config.AddonOverride) (map[string][]byte, error) {
+func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon *addonpkg.Addon, meta *shootMetadata, manifest *addonpkg.AddonManifest, configMapValues map[string]string, perShootOverride *config.AddonOverride) (map[string][]byte, [][]byte, error) {
 	merged := map[string]interface{}{}
 
 	if configMapValues != nil {
@@ -2037,7 +2038,7 @@ func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon 
 		if raw, ok := configMapValues[baseKey]; ok {
 			baseVals, err := parseYAMLValues(raw)
 			if err != nil {
-				return nil, fmt.Errorf("parse ConfigMap values %s: %w", baseKey, err)
+				return nil, nil, fmt.Errorf("parse ConfigMap values %s: %w", baseKey, err)
 			}
 			merged = baseVals
 		}
@@ -2048,7 +2049,7 @@ func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon 
 			if raw, ok := configMapValues[providerKey]; ok {
 				providerVals, err := parseYAMLValues(raw)
 				if err != nil {
-					return nil, fmt.Errorf("parse ConfigMap values %s: %w", providerKey, err)
+					return nil, nil, fmt.Errorf("parse ConfigMap values %s: %w", providerKey, err)
 				}
 				merged = mergeMaps(merged, providerVals)
 			}
@@ -2058,7 +2059,7 @@ func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon 
 		baseVals, err := readEmbeddedValues(embedded.Addons, "addons/"+addon.ValuesPath+"/values.yaml")
 		if err != nil {
 			if !isNotExist(err) {
-				return nil, fmt.Errorf("read base values: %w", err)
+				return nil, nil, fmt.Errorf("read base values: %w", err)
 			}
 		} else {
 			merged = baseVals
@@ -2069,7 +2070,7 @@ func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon 
 			providerVals, err := readEmbeddedValues(embedded.Addons, providerFile)
 			if err != nil {
 				if !isNotExist(err) {
-					return nil, fmt.Errorf("read provider values: %w", err)
+					return nil, nil, fmt.Errorf("read provider values: %w", err)
 				}
 			} else {
 				merged = mergeMaps(merged, providerVals)
@@ -2101,7 +2102,7 @@ func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon 
 	if perShootOverride != nil && perShootOverride.ValuesOverride != "" {
 		overrideVals, err := parseYAMLValues(perShootOverride.ValuesOverride)
 		if err != nil {
-			return nil, fmt.Errorf("parse per-shoot values override for %s: %w", addon.Name, err)
+			return nil, nil, fmt.Errorf("parse per-shoot values override for %s: %w", addon.Name, err)
 		}
 		if perShootOverride.IsOverrideMode() {
 			// Full replace — discard all previous values
@@ -2129,7 +2130,7 @@ func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon 
 	// Standard rendering path: Gardener chartrenderer (hooks silently dropped)
 	renderer, err := gardenerchartrenderer.NewForConfig(a.restConfig)
 	if err != nil {
-		return nil, fmt.Errorf("create chart renderer: %w", err)
+		return nil, nil, fmt.Errorf("create chart renderer: %w", err)
 	}
 
 	var rendered *gardenerchartrenderer.RenderedChart
@@ -2137,36 +2138,37 @@ func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon 
 	if addon.Chart.OCI != "" {
 		archive, err := a.pullOCIChart(addon)
 		if err != nil {
-			return nil, fmt.Errorf("pull OCI chart %s: %w", addon.Chart.OCI, err)
+			return nil, nil, fmt.Errorf("pull OCI chart %s: %w", addon.Chart.OCI, err)
 		}
 		rendered, err = renderer.RenderArchive(archive, releaseName, ns, merged)
 		if err != nil {
-			return nil, fmt.Errorf("render OCI chart %s: %w", addon.Chart.OCI, err)
+			return nil, nil, fmt.Errorf("render OCI chart %s: %w", addon.Chart.OCI, err)
 		}
 	} else if addon.Chart.Path != "" {
 		chartPath := "addons/" + addon.Chart.Path
 		rendered, err = renderer.RenderEmbeddedFS(embedded.Addons, chartPath, releaseName, ns, merged)
 		if err != nil {
-			return nil, fmt.Errorf("render embedded chart %s: %w", chartPath, err)
+			return nil, nil, fmt.Errorf("render embedded chart %s: %w", chartPath, err)
 		}
 	} else {
-		return nil, fmt.Errorf("addon %s: no chart source (oci or path) specified", addon.Name)
+		return nil, nil, fmt.Errorf("addon %s: no chart source (oci or path) specified", addon.Name)
 	}
 
-	return rendered.AsSecretData(), nil
+	// Standard path has no hook Jobs
+	return rendered.AsSecretData(), nil, nil
 }
 
 // renderAddonChartWithHooks uses the hook-aware renderer to include Helm
 // hook-annotated templates. Delete hooks are stored in a separate secret
 // for execution during addon removal.
-func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logger, addon *addonpkg.Addon, releaseName, namespace, controlPlaneNamespace string, isSeedRender bool, values map[string]interface{}) (map[string][]byte, error) {
+func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logger, addon *addonpkg.Addon, releaseName, namespace, controlPlaneNamespace string, isSeedRender bool, values map[string]interface{}) (map[string][]byte, [][]byte, error) {
 	disc, err := discovery.NewDiscoveryClientForConfig(a.restConfig)
 	if err != nil {
-		return nil, fmt.Errorf("create discovery client: %w", err)
+		return nil, nil, fmt.Errorf("create discovery client: %w", err)
 	}
 	sv, err := disc.ServerVersion()
 	if err != nil {
-		return nil, fmt.Errorf("get server version: %w", err)
+		return nil, nil, fmt.Errorf("get server version: %w", err)
 	}
 
 	hookRenderer := hookaware.NewHookAwareRenderer(sv)
@@ -2183,24 +2185,24 @@ func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logge
 	if addon.Chart.OCI != "" {
 		archive, err := a.pullOCIChart(addon)
 		if err != nil {
-			return nil, fmt.Errorf("pull OCI chart %s: %w", addon.Chart.OCI, err)
+			return nil, nil, fmt.Errorf("pull OCI chart %s: %w", addon.Chart.OCI, err)
 		}
 		result, err = hookRenderer.RenderArchive(archive, releaseName, namespace, values, hookCfg)
 		if err != nil {
-			return nil, fmt.Errorf("render OCI chart with hooks %s: %w", addon.Chart.OCI, err)
+			return nil, nil, fmt.Errorf("render OCI chart with hooks %s: %w", addon.Chart.OCI, err)
 		}
 	} else if addon.Chart.Path != "" {
 		chartPath := "addons/" + addon.Chart.Path
 		chart, err := loadEmbeddedChart(embedded.Addons, chartPath)
 		if err != nil {
-			return nil, fmt.Errorf("load embedded chart %s: %w", chartPath, err)
+			return nil, nil, fmt.Errorf("load embedded chart %s: %w", chartPath, err)
 		}
 		result, err = hookRenderer.RenderChart(chart, releaseName, namespace, values, hookCfg)
 		if err != nil {
-			return nil, fmt.Errorf("render embedded chart with hooks %s: %w", chartPath, err)
+			return nil, nil, fmt.Errorf("render embedded chart with hooks %s: %w", chartPath, err)
 		}
 	} else {
-		return nil, fmt.Errorf("addon %s: no chart source (oci or path) specified", addon.Name)
+		return nil, nil, fmt.Errorf("addon %s: no chart source (oci or path) specified", addon.Name)
 	}
 
 	// Persist delete hooks in a Secret for later execution during addon removal.
@@ -2217,11 +2219,11 @@ func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logge
 	// also contains the hook Secrets (with ignore annotation) so the GRM
 	// tracks them for lifecycle management but never overwrites them.
 	//
-	// Shoot renders: everything is in the MR. Hook Secrets already have
-	// the ignore annotation (set by renderer). Hook Jobs get ignore +
-	// delete-on-invalid-update annotations here. The GRM applies
-	// resources in kind order (Secrets → Jobs → Deployments), providing
-	// correct ordering naturally.
+	// Shoot renders: Jobs are NOT included in the persistent MR. They are
+	// returned separately for the caller to apply via temp MR with state
+	// tracking. Hook Secrets are in MRData with ignore annotation (set by
+	// renderer). GRM applies resources in kind order (Secrets before
+	// Deployments), so Secrets exist before the temp MR Job runs.
 	if isSeedRender {
 		// Apply hook Secrets directly BEFORE Jobs — Jobs may write to
 		// these Secrets and need them to exist first.
@@ -2232,17 +2234,13 @@ func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logge
 		if len(result.OneTimeJobs) > 0 {
 			a.applyOneTimeJobs(ctx, log, a.restConfig, namespace, addon.Name, result.OneTimeJobs)
 		}
-	} else {
-		// Shoot renders: add Jobs to MR with GRM annotations.
-		// Hook Secrets are already in MRData with ignore annotation
-		// (injected by the renderer).
-		for i, jobYAML := range result.OneTimeJobs {
-			key := fmt.Sprintf("hook-job-%s-%d.yaml", addon.Name, i)
-			result.MRData[key] = hookaware.InjectGRMJobAnnotations(jobYAML)
-		}
+		// Seed path handles Jobs directly — none to return
+		return result.MRData, nil, nil
 	}
 
-	return result.MRData, nil
+	// Shoot renders: return Jobs separately for temp MR application by caller.
+	// Do NOT add to result.MRData — they must not be in the persistent MR.
+	return result.MRData, result.OneTimeJobs, nil
 }
 
 // applyHookSecrets applies hook Secret resources directly to the cluster

@@ -416,8 +416,14 @@ metadata:
 
 		// Apply shoot-side hook Jobs via temporary MR with spec hash dedup.
 		// Jobs run once, temp MR is deleted, hash recorded in status.
+		// If transitioning from an older version (HookJobsCompleted never
+		// set but addon was previously deployed), skip the temp MR — the
+		// Job already ran under the old version. Creating a temp MR during
+		// transition would conflict with the persistent MR's cleanup of
+		// the old Job resource.
 		if len(shootHookJobs) > 0 {
-			a.applyShootHookJobs(ctx, log, ex.Namespace, addon.Name, shootHookJobs, addonStatus)
+			previouslyDeployed := prevStatus != nil && prevStatus.Addons != nil && prevStatus.Addons[addon.Name] != nil
+			a.applyShootHookJobs(ctx, log, ex.Namespace, addon.Name, shootHookJobs, addonStatus, previouslyDeployed)
 		}
 
 		log.Info("Deploying addon ManagedResource", "addon", addon.Name, "managedResource", mrName, "targetNamespace", ns)
@@ -2359,7 +2365,7 @@ func (a *actuator) applyHookSecrets(ctx context.Context, log logr.Logger, restCo
 //   - Next reconcile: MR healthy → hash recorded, temp MR deleted
 //   - Subsequent reconciles: hash matches → skip (<1ms)
 //   - Chart upgrade: hash differs → new temp MR (non-blocking)
-func (a *actuator) applyShootHookJobs(ctx context.Context, log logr.Logger, controlPlaneNamespace, addonName string, jobs [][]byte, addonStatus *config.AddonStatus) {
+func (a *actuator) applyShootHookJobs(ctx context.Context, log logr.Logger, controlPlaneNamespace, addonName string, jobs [][]byte, addonStatus *config.AddonStatus, previouslyDeployed bool) {
 	prevHashes := addonStatus.HookJobsCompleted
 	newHashes := make(map[string]string, len(jobs))
 
@@ -2374,6 +2380,20 @@ func (a *actuator) applyShootHookJobs(ctx context.Context, log logr.Logger, cont
 				newHashes[jobKey] = specHash
 				continue
 			}
+		}
+
+		// Transition path: addon was previously deployed but HookJobsCompleted
+		// was never set (upgrading from v0.6.x where Jobs were in the persistent
+		// MR). The Job already ran under the old version. Don't create a temp MR
+		// — it would conflict with GRM's cleanup of the old Job from the
+		// persistent MR (circular dependency: persistent MR deletes Job, temp MR
+		// recreates it, GRM loops forever).
+		if prevHashes == nil && previouslyDeployed {
+			log.Info("Transition: recording hook Job hash without running (already completed under previous version)", "addon", addonName, "job", jobKey)
+			newHashes[jobKey] = specHash
+			// Clean up any stale temp MR from a failed previous attempt
+			_ = managedresources.DeleteForShoot(ctx, a.client, controlPlaneNamespace, mrName)
+			continue
 		}
 
 		// Check if a temp MR already exists (from a previous reconcile)

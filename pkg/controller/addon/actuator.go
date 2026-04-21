@@ -109,6 +109,7 @@ type actuator struct {
 	restConfig         *rest.Config
 	chartPuller        *oci.ChartPuller
 	seedAddonsHash             string
+	seedJobHashes              map[string]string // addonName/jobKey → specHash, persisted in ConfigMap
 	managedSeedChecked         bool
 	managedSeedResult          bool
 	seedProviderType           string
@@ -1120,6 +1121,13 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 		meta.ControlNamespace = namespace
 	}
 
+	// Load seed hook Job hashes from the seed-addon-state ConfigMap.
+	// applyOneTimeJobs (called during rendering) uses these to skip
+	// Jobs that have already completed with the same spec.
+	a.mu.Lock()
+	a.seedJobHashes = a.readSeedJobHashes(ctx, extensionNS)
+	a.mu.Unlock()
+
 	// Render all seed addon charts first, then hash the rendered output.
 	// This ensures any change — manifest, config values, template variables,
 	// or code — triggers re-deployment.
@@ -1330,8 +1338,16 @@ func (a *actuator) cleanupRemovedSeedAddons(ctx context.Context, log logr.Logger
 	}
 	sort.Strings(entries)
 
+	// Include seed hook Job hashes in the ConfigMap
+	a.mu.Lock()
+	hookHashStr := a.encodeSeedJobHashes()
+	a.mu.Unlock()
+
 	cmData := map[string]string{
 		"addonMappings": strings.Join(entries, ","),
+	}
+	if hookHashStr != "" {
+		cmData["hookJobHashes"] = hookHashStr
 	}
 
 	if cm.Name == "" {
@@ -1350,6 +1366,42 @@ func (a *actuator) cleanupRemovedSeedAddons(ctx context.Context, log logr.Logger
 			log.Info("Failed to update seed addon state ConfigMap", "error", err)
 		}
 	}
+}
+
+// readSeedJobHashes reads hook Job completion hashes from the seed-addon-state
+// ConfigMap. Returns nil if the ConfigMap or key doesn't exist.
+func (a *actuator) readSeedJobHashes(ctx context.Context, extensionNS string) map[string]string {
+	cm := &corev1.ConfigMap{}
+	if err := a.client.Get(ctx, types.NamespacedName{Name: seedAddonStateCMName, Namespace: extensionNS}, cm); err != nil {
+		return nil
+	}
+
+	data, ok := cm.Data["hookJobHashes"]
+	if !ok || data == "" {
+		return nil
+	}
+
+	result := map[string]string{}
+	for _, entry := range strings.Split(data, ",") {
+		parts := strings.SplitN(strings.TrimSpace(entry), "=", 2)
+		if len(parts) == 2 && parts[0] != "" {
+			result[parts[0]] = parts[1]
+		}
+	}
+	return result
+}
+
+// encodeSeedJobHashes serializes the seed hook Job hashes for ConfigMap storage.
+func (a *actuator) encodeSeedJobHashes() string {
+	if len(a.seedJobHashes) == 0 {
+		return ""
+	}
+	var entries []string
+	for key, hash := range a.seedJobHashes {
+		entries = append(entries, key+"="+hash)
+	}
+	sort.Strings(entries)
+	return strings.Join(entries, ",")
 }
 
 // --------------------------------------------------------------------------

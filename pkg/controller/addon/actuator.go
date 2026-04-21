@@ -2438,13 +2438,21 @@ func (a *actuator) applyShootHookJobs(ctx context.Context, log logr.Logger, cont
 	addonStatus.HookJobsCompleted = newHashes
 }
 
-// applyOneTimeJobs applies hook Jobs directly to the cluster. Skips Jobs
-// that already exist with the same spec (same chart version). If the spec
-// changed (chart upgrade), deletes the old Job and creates the new one.
+// applyOneTimeJobs applies hook Jobs directly to the seed/runtime cluster.
+// Uses two-tier dedup to prevent recreation after TTL deletion:
 //
-// This replaces Helm's hook lifecycle in the MR model:
-//   - before-hook-creation: honored via spec hash comparison + delete/recreate
-//   - hook-succeeded: not enforced (completed Jobs persist for debugging)
+//  1. State check (a.seedJobHashes): if the spec hash matches what was
+//     previously recorded, skip entirely — don't even check the cluster.
+//     This handles the case where Kubernetes TTL deleted the completed Job.
+//
+//  2. Cluster check (fallback): if no state exists (first deploy, state
+//     loss), check the cluster for an existing Job with a matching
+//     spec-hash annotation. If found, skip and record the hash.
+//
+// On chart upgrade (different hash), the old Job is deleted and a new one
+// is created. The blocking wait (120s) only occurs for newly created Jobs
+// — needed for ordering (Job must complete before GRM applies Deployments
+// that depend on Job-created Secrets).
 func (a *actuator) applyOneTimeJobs(ctx context.Context, log logr.Logger, restConfig *rest.Config, namespace, addonName string, jobs [][]byte) {
 	directClient, err := client.New(restConfig, client.Options{})
 	if err != nil {
@@ -2452,12 +2460,9 @@ func (a *actuator) applyOneTimeJobs(ctx context.Context, log logr.Logger, restCo
 		return
 	}
 
-	// Track newly created Jobs so we can wait for them to complete.
-	// This ensures hook Jobs finish before GRM applies Deployments that
-	// depend on their output (e.g., Secrets created by the Job).
 	var createdJobNames []string
 
-	for _, jobYAML := range jobs {
+	for i, jobYAML := range jobs {
 		objs, err := parseManifest(jobYAML)
 		if err != nil {
 			log.Info("Failed to parse hook Job manifest", "addon", addonName, "error", err)
@@ -2471,11 +2476,25 @@ func (a *actuator) applyOneTimeJobs(ctx context.Context, log logr.Logger, restCo
 
 			obj.SetNamespace(namespace)
 			jobName := obj.GetName()
-
-			// Compute a hash of the desired Job spec for change detection
+			jobKey := fmt.Sprintf("%s/hook-job-%s-%d", addonName, addonName, i)
 			desiredHash := fmt.Sprintf("%x", sha256.Sum256(jobYAML))[:16]
 
-			// Tag the Job with the spec hash so we can detect changes
+			// Tier 1: State-based dedup. If the hash matches what we
+			// previously recorded, skip entirely. The Job may have been
+			// deleted by TTL — that's fine, it already completed.
+			a.mu.Lock()
+			prevHash := ""
+			if a.seedJobHashes != nil {
+				prevHash = a.seedJobHashes[jobKey]
+			}
+			a.mu.Unlock()
+
+			if prevHash == desiredHash {
+				continue // already completed with this spec
+			}
+
+			// Tier 2: Cluster check (fallback for first deploy / state loss).
+			// Tag the Job with the spec hash annotation for future cluster checks.
 			annotations := obj.GetAnnotations()
 			if annotations == nil {
 				annotations = make(map[string]string)
@@ -2483,7 +2502,6 @@ func (a *actuator) applyOneTimeJobs(ctx context.Context, log logr.Logger, restCo
 			annotations["shoot-addon-service/spec-hash"] = desiredHash
 			obj.SetAnnotations(annotations)
 
-			// Check if Job already exists
 			existing := &unstructured.Unstructured{}
 			existing.SetGroupVersionKind(obj.GroupVersionKind())
 			err := directClient.Get(ctx, types.NamespacedName{
@@ -2492,15 +2510,21 @@ func (a *actuator) applyOneTimeJobs(ctx context.Context, log logr.Logger, restCo
 			}, existing)
 
 			if err == nil {
-				// Job exists — compare spec hash
+				// Job exists on cluster — compare spec hash
 				existingHash := ""
 				if ea := existing.GetAnnotations(); ea != nil {
 					existingHash = ea["shoot-addon-service/spec-hash"]
 				}
 
 				if existingHash == desiredHash {
-					// Same spec — skip
 					log.Info("Hook Job unchanged, skipping", "addon", addonName, "job", jobName)
+					// Record in state so future reconciles use tier 1
+					a.mu.Lock()
+					if a.seedJobHashes == nil {
+						a.seedJobHashes = map[string]string{}
+					}
+					a.seedJobHashes[jobKey] = desiredHash
+					a.mu.Unlock()
 					continue
 				}
 
@@ -2513,7 +2537,6 @@ func (a *actuator) applyOneTimeJobs(ctx context.Context, log logr.Logger, restCo
 					log.Info("Failed to delete old hook Job", "addon", addonName, "job", jobName, "error", err)
 					continue
 				}
-				// Wait briefly for deletion to propagate
 				time.Sleep(2 * time.Second)
 			}
 
@@ -2529,14 +2552,24 @@ func (a *actuator) applyOneTimeJobs(ctx context.Context, log logr.Logger, restCo
 		}
 	}
 
-	// Wait for newly created Jobs to complete before returning.
-	// On first deploy this ensures the Job (e.g., connector registration)
-	// finishes before GRM applies Deployments that depend on its output.
-	// On subsequent reconciles, Jobs are skipped (same hash) so no wait.
+	// Wait for newly created Jobs to complete. Only blocks on first deploy
+	// or chart upgrade. On steady state (tier 1 skip), this never runs.
 	if len(createdJobNames) > 0 {
 		if err := a.waitForHookJobs(ctx, log, directClient, namespace, addonName, createdJobNames, 120); err != nil {
 			log.Info("Hook Job wait completed with error, proceeding", "addon", addonName, "error", err)
 		}
+		// Record hashes for all Jobs (both newly created and existing).
+		// This ensures tier 1 catches them on the next reconcile even
+		// if TTL deletes the completed Job.
+		a.mu.Lock()
+		if a.seedJobHashes == nil {
+			a.seedJobHashes = map[string]string{}
+		}
+		for i, jobYAML := range jobs {
+			jobKey := fmt.Sprintf("%s/hook-job-%s-%d", addonName, addonName, i)
+			a.seedJobHashes[jobKey] = fmt.Sprintf("%x", sha256.Sum256(jobYAML))[:16]
+		}
+		a.mu.Unlock()
 	}
 }
 

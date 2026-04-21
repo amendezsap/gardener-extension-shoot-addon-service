@@ -61,10 +61,7 @@ The extension cleans up kept Secrets after delete hooks complete. Hook Secret na
 
 - **Seed renders** (runtime cluster): Jobs are applied directly by the actuator with deduplication and completion wait. Hook Secrets are applied directly first (create-or-skip) to ensure they exist before Jobs run. The actuator checks if the Job already exists by comparing a spec hash annotation. Same hash = skip. Different hash (chart upgrade) = delete old + create new. Newly created Jobs are polled for completion (120s timeout).
 
-- **Shoot renders** (shoot clusters via MR): Jobs are included in the MR with GRM annotations and spec modifications:
-  - `resources.gardener.cloud/ignore: "true"` — GRM creates the Job once and never re-applies it (Job spec is immutable, and admission mutations cause perpetual diffs)
-  - `resources.gardener.cloud/skip-health-check: "true"` — completed/failed Jobs don't block MR health
-  - `ttlSecondsAfterFinished` is stripped — prevents Kubernetes from deleting the completed Job, which would cause GRM to recreate it on the next reconcile (`ignore` allows creation when the resource is NotFound)
+- **Shoot renders** (shoot clusters via temp MR): Jobs are NOT included in the persistent addon MR. Instead, each Job is applied through a temporary shoot-class MR with spec hash deduplication (tracked in `AddonStatus.HookJobsCompleted`). The GRM applies the Job to the shoot, the extension polls for completion, then deletes the temp MR. On subsequent reconciles, Jobs with unchanged spec hashes are skipped entirely — no MR, no GRM interaction. On chart upgrades (different hash), the Job runs again via a fresh temp MR. This mirrors Helm's hook lifecycle: run once per install/upgrade event, then gone.
 
 ### Delete Hooks (pre-delete, post-delete)
 

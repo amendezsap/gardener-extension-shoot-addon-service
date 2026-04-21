@@ -412,7 +412,12 @@ metadata:
 		if err != nil {
 			return fmt.Errorf("failed to render chart for addon %s: %w", addon.Name, err)
 		}
-		_ = shootHookJobs // used in commit 3
+
+		// Apply shoot-side hook Jobs via temporary MR with spec hash dedup.
+		// Jobs run once, temp MR is deleted, hash recorded in status.
+		if len(shootHookJobs) > 0 {
+			a.applyShootHookJobs(ctx, log, ex.Namespace, addon.Name, shootHookJobs, addonStatus)
+		}
 
 		log.Info("Deploying addon ManagedResource", "addon", addon.Name, "managedResource", mrName, "targetNamespace", ns)
 		if err := managedresources.CreateForShoot(ctx, a.client, ex.Namespace, mrName, "shoot-addon-service", false, secretData); err != nil {
@@ -2273,6 +2278,104 @@ func (a *actuator) applyHookSecrets(ctx context.Context, log logr.Logger, restCo
 			}
 		}
 	}
+}
+
+// applyShootHookJobs applies hook Jobs to a shoot cluster via temporary
+// ManagedResources with spec hash deduplication. Each Job gets its own
+// temp MR. Jobs that have already completed with the same spec hash
+// (tracked in AddonStatus.HookJobsCompleted) are skipped.
+//
+// This mirrors Helm's hook lifecycle:
+//   - First install: Job runs once, completes, temp MR deleted
+//   - Subsequent reconciles: same hash → skip (no Job, no MR)
+//   - Chart upgrade: different hash → new temp MR, Job runs again
+//   - External deletion: no recreation (Job not in any persistent MR)
+func (a *actuator) applyShootHookJobs(ctx context.Context, log logr.Logger, controlPlaneNamespace, addonName string, jobs [][]byte, addonStatus *config.AddonStatus) {
+	prevHashes := addonStatus.HookJobsCompleted
+	newHashes := make(map[string]string, len(jobs))
+
+	for i, jobYAML := range jobs {
+		jobKey := fmt.Sprintf("hook-job-%s-%d", addonName, i)
+		specHash := fmt.Sprintf("%x", sha256.Sum256(jobYAML))[:16]
+
+		// Check if this Job already ran with the same spec
+		if prevHashes != nil {
+			if prevHash, ok := prevHashes[jobKey]; ok && prevHash == specHash {
+				log.Info("Shoot hook Job unchanged, skipping", "addon", addonName, "job", jobKey)
+				newHashes[jobKey] = specHash
+				continue
+			}
+		}
+
+		// First deploy or chart upgrade — apply via temp MR
+		mrName := fmt.Sprintf("addon-hook-%s-%d", addonName, i)
+		mrData := map[string][]byte{
+			jobKey + ".yaml": jobYAML,
+		}
+
+		log.Info("Applying shoot hook Job via temp MR", "addon", addonName, "job", jobKey, "managedResource", mrName)
+
+		if err := managedresources.CreateForShoot(ctx, a.client, controlPlaneNamespace, mrName, "shoot-addon-service", false, mrData); err != nil {
+			log.Info("Failed to create temp MR for hook Job", "addon", addonName, "job", jobKey, "error", err)
+			continue
+		}
+
+		// Poll MR status for Job completion (same pattern as executeShootDeleteHooks)
+		deadline := time.Now().Add(120 * time.Second)
+		var completed bool
+
+		for time.Now().Before(deadline) {
+			mr := &resourcesv1alpha1.ManagedResource{}
+			mrKey := types.NamespacedName{Name: mrName, Namespace: controlPlaneNamespace}
+			if err := a.client.Get(ctx, mrKey, mr); err != nil {
+				if apierrors.IsNotFound(err) {
+					time.Sleep(5 * time.Second)
+					continue
+				}
+				log.Info("Failed to get temp MR for hook Job", "addon", addonName, "error", err)
+				break
+			}
+
+			var applied, healthy, unhealthy bool
+			for _, cond := range mr.Status.Conditions {
+				switch gardencorev1beta1.ConditionType(cond.Type) {
+				case resourcesv1alpha1.ResourcesApplied:
+					applied = cond.Status == gardencorev1beta1.ConditionTrue
+				case resourcesv1alpha1.ResourcesHealthy:
+					healthy = cond.Status == gardencorev1beta1.ConditionTrue
+					unhealthy = cond.Status == gardencorev1beta1.ConditionFalse
+				}
+			}
+
+			if applied && healthy {
+				log.Info("Shoot hook Job completed", "addon", addonName, "job", jobKey)
+				completed = true
+				break
+			}
+			if applied && unhealthy {
+				log.Info("Shoot hook Job failed", "addon", addonName, "job", jobKey)
+				completed = true // failed but done — record hash to avoid re-running
+				break
+			}
+
+			time.Sleep(5 * time.Second)
+		}
+
+		if !completed {
+			log.Info("Shoot hook Job timed out", "addon", addonName, "job", jobKey, "timeout", 120)
+		}
+
+		// Delete temp MR (fire-and-forget)
+		if err := managedresources.DeleteForShoot(ctx, a.client, controlPlaneNamespace, mrName); err != nil {
+			log.Info("Failed to delete temp MR for hook Job", "addon", addonName, "error", err)
+		}
+
+		// Record hash regardless of success — avoid re-running on every reconcile.
+		// If the Job failed, the chart/config needs to change (new hash) to retry.
+		newHashes[jobKey] = specHash
+	}
+
+	addonStatus.HookJobsCompleted = newHashes
 }
 
 // applyOneTimeJobs applies hook Jobs directly to the cluster. Skips Jobs

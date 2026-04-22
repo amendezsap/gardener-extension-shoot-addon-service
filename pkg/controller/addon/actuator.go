@@ -456,20 +456,23 @@ metadata:
 		a.cleanupRenamedManagedResource(ctx, log, ex.Namespace, oldName, mrRegistrySecrets)
 	}
 
-	// Detect and clean up addons that were removed from the manifest.
-	// Compare previous status (what was deployed) against current manifest.
+	// Detect and clean up addons that are no longer active on this shoot.
+	// Compare previous status (what was deployed) against newStatus (what was
+	// actually deployed THIS reconcile). This catches both:
+	// - Addons removed from the manifest entirely
+	// - Addons disabled per-shoot via providerConfig override
 	if prevStatus != nil && len(prevStatus.Addons) > 0 {
-		currentAddons := make(map[string]bool, len(manifest.Addons))
-		for i := range manifest.Addons {
-			currentAddons[manifest.Addons[i].Name] = true
+		currentAddons := make(map[string]bool, len(newStatus.Addons))
+		for addonName := range newStatus.Addons {
+			currentAddons[addonName] = true
 		}
 
 		for addonName, addonStatus := range prevStatus.Addons {
 			if currentAddons[addonName] {
-				continue // still in manifest
+				continue // still active on this shoot
 			}
 
-			log.Info("Addon removed from manifest, cleaning up", "addon", addonName)
+			log.Info("Addon no longer active, cleaning up", "addon", addonName)
 
 			// Execute pre-delete hooks on the shoot via temporary MR.
 			// Removed addons have no hook config, so use 60s timeout and always continue.

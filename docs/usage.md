@@ -324,7 +324,9 @@ Template execution is sandboxed:
 
 ## Per-Shoot Configuration
 
-Shoots can override extension defaults via `providerConfig` in the Shoot spec:
+Shoots can override extension defaults via `providerConfig` in the Shoot spec. Per-shoot overrides take **highest priority** — they override the global manifest setting.
+
+### Disabling an Addon Per-Shoot
 
 ```yaml
 apiVersion: core.gardener.cloud/v1beta1
@@ -335,13 +337,70 @@ spec:
       providerConfig:
         apiVersion: shoot-addon-service.extensions.gardener.cloud/v1alpha1
         kind: Configuration
-        aws:
-          vpcEndpoint:
-            enabled: true    # Override default VPC endpoint setting
         addons:
-          fluent-bit:
-            enabled: false   # Disable fluent-bit for this shoot
+          my-addon:
+            enabled: false   # Disable on this shoot only
 ```
+
+When an addon is disabled per-shoot:
+- The addon's ManagedResource is deleted from the shoot
+- Delete hooks run (e.g., connector deregistration)
+- All addon resources are removed from the shoot
+- Other shoots are unaffected — the addon remains active globally
+
+When the override is removed or set back to `enabled: true`, the addon is re-deployed as a fresh install (hook Jobs run again).
+
+### Enabling a Globally Disabled Addon Per-Shoot
+
+```yaml
+# In the manifest: my-addon has enabled: false (disabled globally)
+# In the Shoot spec: override enables it on this shoot only
+providerConfig:
+  addons:
+    my-addon:
+      enabled: true   # Override global disable for this shoot
+```
+
+### Overriding Values Per-Shoot
+
+```yaml
+providerConfig:
+  addons:
+    my-addon:
+      valuesOverride: |
+        config:
+          logLevel: debug
+      valuesMode: merge   # "merge" (default) or "override"
+```
+
+- **merge** (default): deep-merge with existing values. Only specified keys change.
+- **override**: full replacement. All previous values are discarded.
+
+### Priority Order
+
+Values are layered (later wins):
+
+1. Base values from ConfigMap (`values.<addon>.yaml`)
+2. Provider-specific values (`values.<addon>.<provider>.yaml`)
+3. `shootValues` from the manifest (with template expansion)
+4. Image overrides from environment variables
+5. **Per-shoot `valuesOverride`** from providerConfig (highest priority)
+
+### AWS Overrides
+
+```yaml
+providerConfig:
+  apiVersion: shoot-addon-service.extensions.gardener.cloud/v1alpha1
+  kind: Configuration
+  aws:
+    vpcEndpoint:
+      enabled: true    # Override default VPC endpoint setting
+```
+
+### Limitations
+
+- Per-shoot overrides only affect **shoot-targeted** addons. Seed addons are shared infrastructure and cannot be disabled per-shoot.
+- Disabling an addon per-shoot triggers the full removal lifecycle including delete hooks. This is intentional — partial removal (resources without hooks) is not supported.
 
 ## AWS Infrastructure
 

@@ -73,7 +73,7 @@ Seed Cluster
 - **Embedded fallback** — optionally embed charts at build time for fully self-contained, air-gapped binaries
 - **Managed seed aware** — skips seed addon deployment on managed seeds (parent seed handles it)
 - **AWS infrastructure** — optional IAM policy attachment and VPC endpoint management per addon
-- **Per-shoot overrides** — shoots can enable/disable addons or toggle features via `providerConfig` (planned)
+- **Per-shoot overrides** — shoots can enable/disable addons or override values via `providerConfig`. See [docs/usage.md](docs/usage.md#per-shoot-configuration)
 - **Helm hook support** — opt-in rendering of hook-annotated templates (pre-install Jobs, delete lifecycle). See [docs/hooks.md](docs/hooks.md)
 - **GRM namespace provisioner** — in-process webhook ensures ManagedResources can deploy to any namespace
 
@@ -144,7 +144,7 @@ spec:
           enabled: true           # use VPC endpoint instead of NAT
 ```
 
-The extension still runs on the shoot — it just skips the disabled addons. AWS infrastructure (IAM policies, VPC endpoints) remains in place.
+Disabling an addon per-shoot triggers **full cleanup**: delete hooks run, the addon's ManagedResource is removed, and all addon resources are deleted from the shoot. Other shoots are unaffected. AWS infrastructure (IAM policies, VPC endpoints) remains in place. Re-enabling the addon re-deploys it as a fresh install.
 
 ### Override addon values per shoot
 

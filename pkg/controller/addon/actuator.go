@@ -1504,16 +1504,25 @@ func (a *actuator) fixStaleGRMConfig(ctx context.Context, log logr.Logger, names
 }
 
 // deleteGRMDeployment deletes the gardener-resource-manager Deployment.
+//
+// WARNING: The GRM is a shared controller for the shoot. Deleting it
+// disrupts ALL ManagedResources on this shoot (~30s) until gardenlet
+// recreates it. Other extensions (provider-aws, networking, etc.) will
+// report transient health failures during this window. This is a known
+// side effect of the stale namespace cache workaround.
+// See: https://github.com/gardener/gardener/issues/14427
 func (a *actuator) deleteGRMDeployment(ctx context.Context, log logr.Logger, namespace string) {
 	deploy := &appsv1.Deployment{}
 	if err := a.client.Get(ctx, types.NamespacedName{
 		Name:      "gardener-resource-manager",
 		Namespace: namespace,
 	}, deploy); err == nil {
+		log.Info("WARNING: Deleting shared GRM Deployment — all extensions on this shoot will experience ~30s health disruption until gardenlet recreates it (workaround for gardener/gardener#14427)",
+			"namespace", namespace, "deployment", "gardener-resource-manager")
 		if err := a.client.Delete(ctx, deploy); err != nil {
 			log.Error(err, "Failed to delete GRM Deployment")
 		} else {
-			log.Info("GRM Deployment deleted")
+			log.Info("GRM Deployment deleted — gardenlet will recreate it on next reconcile", "namespace", namespace)
 		}
 	}
 }

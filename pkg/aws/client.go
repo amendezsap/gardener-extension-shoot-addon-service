@@ -2,6 +2,7 @@ package aws
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
+	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
@@ -468,7 +470,10 @@ func (c *Client) addShootToEndpointTag(ctx context.Context, endpointID, shootNam
 		}
 	}
 
-	newShoots := append(currentShoots, shootNamespace)
+	// Copy the slice to avoid mutating the caller's backing array
+	newShoots := make([]string, len(currentShoots)+1)
+	copy(newShoots, currentShoots)
+	newShoots[len(currentShoots)] = shootNamespace
 	_, err := c.ec2.CreateTags(ctx, &ec2.CreateTagsInput{
 		Resources: []string{endpointID},
 		Tags: []ec2types.Tag{
@@ -524,5 +529,13 @@ func joinShoots(shoots []string) string {
 }
 
 func isNoSuchEntity(err error) bool {
-	return err != nil && strings.Contains(fmt.Sprintf("%v", err), "NoSuchEntity")
+	if err == nil {
+		return false
+	}
+	var nse *iamtypes.NoSuchEntityException
+	if errors.As(err, &nse) {
+		return true
+	}
+	// Fallback for wrapped errors that don't expose the typed exception
+	return strings.Contains(err.Error(), "NoSuchEntity")
 }

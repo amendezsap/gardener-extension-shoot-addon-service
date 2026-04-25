@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 
+	yamlutil "sigs.k8s.io/yaml"
+
 	helmchart "helm.sh/helm/v3/pkg/chart"
 	helmloader "helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/chartutil"
@@ -301,8 +303,21 @@ func (r *HookAwareRenderer) render(chart *helmchart.Chart, releaseName, namespac
 // isHookSecret returns true if the manifest content is a Secret resource.
 // Hook Secrets are routed to one-time application because hook Jobs may
 // populate them with real data after creation.
+// extractKind extracts the "kind" field from a YAML manifest string.
+// Returns empty string if parsing fails. More reliable than
+// strings.Contains which can match on comments, labels, or embedded YAML.
+func extractKind(manifest string) string {
+	var obj struct {
+		Kind string `json:"kind"`
+	}
+	if err := yamlutil.Unmarshal([]byte(manifest), &obj); err != nil {
+		return ""
+	}
+	return obj.Kind
+}
+
 func isHookSecret(content string) bool {
-	return strings.Contains(content, "kind: Secret")
+	return extractKind(content) == "Secret"
 }
 
 // isHookJob returns true if the hook is a Job resource. ALL hook Jobs are
@@ -315,7 +330,7 @@ func isHookSecret(content string) bool {
 //
 // Direct application with skip-if-exists gives the correct "run once" behavior.
 func isHookJob(hook *release.Hook) bool {
-	return strings.Contains(hook.Manifest, "kind: Job")
+	return extractKind(hook.Manifest) == "Job"
 }
 
 // hookClassification holds the parsed hook types for a single hook resource.

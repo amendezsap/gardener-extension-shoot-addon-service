@@ -3,12 +3,13 @@ package gcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"golang.org/x/oauth2/google"
 	cloudresourcemanager "google.golang.org/api/cloudresourcemanager/v1"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
@@ -255,5 +256,12 @@ func removeBinding(policy *cloudresourcemanager.Policy, role, member string) {
 
 // isConflictError checks if an error is an etag conflict (HTTP 409).
 func isConflictError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "409")
+	if err == nil {
+		return false
+	}
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) {
+		return apiErr.Code == 409
+	}
+	return false
 }

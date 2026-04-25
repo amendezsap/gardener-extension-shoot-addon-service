@@ -45,15 +45,15 @@ func readCachedArchive(cacheDir, key string) []byte {
 // writeCache writes the chart archive and digest to the cache directory.
 func writeCache(cacheDir, key string, archive []byte, digest string) error {
 	dir := cachePath(cacheDir, key)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("create cache dir: %w", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(dir, "chart.tgz"), archive, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "chart.tgz"), archive, 0600); err != nil {
 		return fmt.Errorf("write chart archive: %w", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(dir, "digest"), []byte(digest), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "digest"), []byte(digest), 0600); err != nil {
 		return fmt.Errorf("write digest: %w", err)
 	}
 

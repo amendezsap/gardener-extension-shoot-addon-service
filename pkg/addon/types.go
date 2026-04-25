@@ -4,6 +4,7 @@ import (
 	"embed"
 	"fmt"
 	"io/fs"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -136,10 +137,10 @@ func (h *AddonHookConfig) GetDeleteTimeout() int {
 // GetDeleteFailurePolicy returns the delete hook failure policy.
 // Defaults to "Continue".
 func (h *AddonHookConfig) GetDeleteFailurePolicy() string {
-	if h.DeleteFailurePolicy == "" || h.DeleteFailurePolicy == "Continue" {
-		return "Continue"
+	if strings.EqualFold(h.DeleteFailurePolicy, "abort") {
+		return "Abort"
 	}
-	return h.DeleteFailurePolicy
+	return "Continue"
 }
 
 // ShouldAbortOnDeleteFailure returns true if delete hooks should block
@@ -279,8 +280,14 @@ func (a *Addon) Validate(efs embed.FS) error {
 	if a.Chart.Git != "" {
 		sources++
 	}
+	if a.Chart.URL != "" {
+		sources++
+	}
+	if a.Chart.TGZ != "" {
+		sources++
+	}
 	if sources == 0 {
-		return fmt.Errorf("addon %q: at least one chart source (path, oci, repo, git) is required", a.Name)
+		return fmt.Errorf("addon %q: at least one chart source (path, oci, repo, git, url, tgz) is required", a.Name)
 	}
 	if sources > 1 {
 		return fmt.Errorf("addon %q: exactly one chart source must be specified, got %d", a.Name, sources)
@@ -316,6 +323,12 @@ func (a *Addon) ValidateRemote() error {
 		sources++
 	}
 	if a.Chart.Git != "" {
+		sources++
+	}
+	if a.Chart.URL != "" {
+		sources++
+	}
+	if a.Chart.TGZ != "" {
 		sources++
 	}
 	if sources == 0 {

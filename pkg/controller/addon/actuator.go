@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -1163,10 +1164,17 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 		mrName := addon.GetSeedManagedResourceName()
 		rendered = append(rendered, renderedAddon{addon, mrName, secretData})
 
-		// Hash the rendered output for change detection
-		for k, v := range secretData {
+		// Hash the rendered output for change detection.
+		// Keys must be sorted — Go map iteration order is random, and
+		// an unstable hash causes spurious redeployments every reconcile.
+		secretKeys := make([]string, 0, len(secretData))
+		for k := range secretData {
+			secretKeys = append(secretKeys, k)
+		}
+		sort.Strings(secretKeys)
+		for _, k := range secretKeys {
 			h.Write([]byte(k))
-			h.Write(v)
+			h.Write(secretData[k])
 		}
 	}
 
@@ -2966,7 +2974,7 @@ func readEmbeddedValues(efs fs.ReadFileFS, path string) (map[string]interface{},
 
 // isNotExist checks if an error indicates a file was not found.
 func isNotExist(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "file does not exist")
+	return err != nil && errors.Is(err, fs.ErrNotExist)
 }
 
 // maxTemplateOutputBytes is the maximum rendered template size (1MB).

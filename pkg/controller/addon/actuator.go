@@ -1524,14 +1524,19 @@ func (a *actuator) deleteGRMDeployment(ctx context.Context, log logr.Logger, nam
 	if err := a.client.Get(ctx, types.NamespacedName{
 		Name:      "gardener-resource-manager",
 		Namespace: namespace,
-	}, deploy); err == nil {
-		log.Info("WARNING: Deleting shared GRM Deployment — all extensions on this shoot will experience ~30s health disruption until gardenlet recreates it (workaround for gardener/gardener#14427)",
-			"namespace", namespace, "deployment", "gardener-resource-manager")
-		if err := a.client.Delete(ctx, deploy); err != nil {
-			log.Error(err, "Failed to delete GRM Deployment")
-		} else {
-			log.Info("GRM Deployment deleted — gardenlet will recreate it on next reconcile", "namespace", namespace)
+	}, deploy); err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.Error(err, "Failed to get GRM Deployment for deletion")
 		}
+		return
+	}
+
+	log.Info("WARNING: Deleting shared GRM Deployment — all extensions on this shoot will experience ~30s health disruption until gardenlet recreates it (workaround for gardener/gardener#14427)",
+		"namespace", namespace, "deployment", "gardener-resource-manager")
+	if err := a.client.Delete(ctx, deploy); err != nil {
+		log.Error(err, "Failed to delete GRM Deployment")
+	} else {
+		log.Info("GRM Deployment deleted — gardenlet will recreate it on next reconcile", "namespace", namespace)
 	}
 }
 
@@ -2646,7 +2651,7 @@ func (a *actuator) persistDeleteHooks(ctx context.Context, log logr.Logger, name
 	key := types.NamespacedName{Name: secretName, Namespace: namespace}
 	err := a.client.Get(ctx, key, secret)
 
-	if err != nil {
+	if apierrors.IsNotFound(err) {
 		// Create new Secret
 		secret = &corev1.Secret{}
 		secret.Name = secretName
@@ -2657,6 +2662,10 @@ func (a *actuator) persistDeleteHooks(ctx context.Context, log logr.Logger, name
 		} else {
 			log.Info("Persisted delete hooks", "addon", addonName, "secret", secretName)
 		}
+		return
+	}
+	if err != nil {
+		log.Info("Failed to read delete hooks Secret", "addon", addonName, "error", err)
 		return
 	}
 
@@ -2685,7 +2694,10 @@ func (a *actuator) executeShootDeleteHooks(ctx context.Context, log logr.Logger,
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{Name: secretName, Namespace: controlPlaneNamespace}
 	if err := a.client.Get(ctx, key, secret); err != nil {
-		return nil // no hooks persisted
+		if apierrors.IsNotFound(err) {
+			return nil // no hooks persisted
+		}
+		return fmt.Errorf("read delete hooks Secret %s: %w", secretName, err)
 	}
 
 	hookData, ok := secret.Data[hookType]
@@ -2792,7 +2804,10 @@ func (a *actuator) executeDeleteHooks(ctx context.Context, log logr.Logger, cont
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{Name: secretName, Namespace: controlPlaneNamespace}
 	if err := a.client.Get(ctx, key, secret); err != nil {
-		return nil // no hooks persisted
+		if apierrors.IsNotFound(err) {
+			return nil // no hooks persisted
+		}
+		return fmt.Errorf("read delete hooks Secret %s: %w", secretName, err)
 	}
 
 	hookData, ok := secret.Data[hookType]
@@ -2833,11 +2848,9 @@ func (a *actuator) executeDeleteHooks(ctx context.Context, log logr.Logger, cont
 			obj.SetNamespace(targetNamespace)
 			if err := directClient.Create(ctx, obj); err != nil {
 				if apierrors.IsAlreadyExists(err) {
-					// Update if already exists
-					if err := directClient.Update(ctx, obj); err != nil {
-						log.Info("Failed to update delete hook resource", "addon", addonName, "kind", obj.GetKind(), "name", obj.GetName(), "error", err)
-					}
-					// If it's a Job that already exists, still track it for waiting
+					// Resource already exists — track Jobs for waiting but don't
+					// attempt Update (Kubernetes Jobs are immutable after creation,
+					// and updating without resourceVersion would always fail).
 					if obj.GetKind() == "Job" {
 						createdJobNames = append(createdJobNames, obj.GetName())
 					}
@@ -2869,36 +2882,50 @@ func (a *actuator) waitForHookJobs(ctx context.Context, log logr.Logger, c clien
 		timeout = 60
 	}
 
-	var hookErr error
+	var errs []error
 	for _, jobName := range jobNames {
 		log.Info("Waiting for hook Job to complete", "addon", addonName, "job", jobName, "timeout", timeout)
 
 		job := &batchv1.Job{}
 		deadline := time.Now().Add(time.Duration(timeout) * time.Second)
+		completed := false
 		for time.Now().Before(deadline) {
 			if err := c.Get(ctx, types.NamespacedName{Name: jobName, Namespace: namespace}, job); err != nil {
-				hookErr = fmt.Errorf("get Job %s: %w", jobName, err)
+				errs = append(errs, fmt.Errorf("get Job %s: %w", jobName, err))
+				completed = true
 				break
 			}
 			if job.Status.Succeeded > 0 {
 				log.Info("Hook Job completed", "addon", addonName, "job", jobName)
+				completed = true
 				break
 			}
 			if job.Status.Failed > 0 {
-				hookErr = fmt.Errorf("hook Job %s failed", jobName)
+				errs = append(errs, fmt.Errorf("hook Job %s failed", jobName))
 				log.Info("Hook Job failed", "addon", addonName, "job", jobName)
+				completed = true
 				break
 			}
 			time.Sleep(5 * time.Second)
 		}
 
-		if time.Now().After(deadline) {
-			hookErr = fmt.Errorf("hook Job %s timed out after %ds", jobName, timeout)
+		if !completed {
+			errs = append(errs, fmt.Errorf("hook Job %s timed out after %ds", jobName, timeout))
 			log.Info("Hook Job timed out", "addon", addonName, "job", jobName, "timeout", timeout)
 		}
 	}
 
-	return hookErr
+	if len(errs) == 0 {
+		return nil
+	}
+	if len(errs) == 1 {
+		return errs[0]
+	}
+	msgs := make([]string, len(errs))
+	for i, e := range errs {
+		msgs[i] = e.Error()
+	}
+	return fmt.Errorf("%d hook Job error(s): %s", len(errs), strings.Join(msgs, "; "))
 }
 
 // parseManifest parses a YAML manifest into unstructured objects.

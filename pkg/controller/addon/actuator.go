@@ -111,6 +111,9 @@ type actuator struct {
 	chartPuller        *oci.ChartPuller
 	seedAddonsHash             string
 	seedJobHashes              map[string]string // addonName/jobKey → specHash, persisted in ConfigMap
+	gardenClient               client.Client     // cached garden (virtual) cluster client
+	gardenClientErr            error             // cached error from garden client creation
+	gardenClientOnce           sync.Once
 	managedSeedChecked         bool
 	managedSeedResult          bool
 	seedProviderType           string
@@ -865,9 +868,22 @@ func (a *actuator) checkManagedSeed(ctx context.Context, log logr.Logger, seedNa
 		return false
 	}
 
+	// Check if this seed is also a shoot by trying to find a Shoot with
+	// the same name. Try the "garden" namespace first (default project,
+	// covers most managed seeds). This is O(1) instead of listing all shoots.
+	shoot := &gardencorev1beta1.Shoot{}
+	if err := gardenClient.Get(ctx, types.NamespacedName{Name: seedName, Namespace: "garden"}, shoot); err == nil {
+		log.Info("Seed is a managed seed (shoot exists with same name)",
+			"seedName", seedName, "shootNamespace", "garden")
+		return true
+	}
+
+	// If not found in "garden", the shoot may be in a different project namespace.
+	// List shoots filtered by name across all namespaces.
 	shootList := &gardencorev1beta1.ShootList{}
-	if err := gardenClient.List(ctx, shootList); err != nil {
-		log.Error(err, "Failed to list shoots for managed seed detection")
+	if err := gardenClient.List(ctx, shootList, client.MatchingFields{"metadata.name": seedName}); err != nil {
+		// Field selector may not be indexed — default to false (safe — seed addons
+		// run unnecessarily rather than being skipped).
 		return false
 	}
 
@@ -1622,30 +1638,36 @@ func (a *actuator) triggerShootReconcile(ctx context.Context, log logr.Logger, m
 	log.Info("Triggered shoot reconcile via garden API", "shoot", shootKey)
 }
 
-// getGardenClient creates a client for the garden (virtual) cluster using the
-// kubeconfig injected by gardenlet when injectGardenKubeconfig is enabled.
-// Returns an error if the GARDEN_KUBECONFIG env var is not set or the
-// kubeconfig cannot be loaded.
+// getGardenClient returns a cached client for the garden (virtual) cluster
+// using the kubeconfig injected by gardenlet. Created once via sync.Once.
 func (a *actuator) getGardenClient() (client.Client, error) {
-	kubeconfigPath := os.Getenv("GARDEN_KUBECONFIG")
-	if kubeconfigPath == "" {
-		return nil, fmt.Errorf("GARDEN_KUBECONFIG not set")
-	}
+	a.gardenClientOnce.Do(func() {
+		kubeconfigPath := os.Getenv("GARDEN_KUBECONFIG")
+		if kubeconfigPath == "" {
+			a.gardenClientErr = fmt.Errorf("GARDEN_KUBECONFIG not set")
+			return
+		}
 
-	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
-	if err != nil {
-		return nil, fmt.Errorf("build garden REST config: %w", err)
-	}
+		restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+		if err != nil {
+			a.gardenClientErr = fmt.Errorf("build garden REST config: %w", err)
+			return
+		}
 
-	gardenScheme := runtime.NewScheme()
-	_ = gardencorev1beta1.AddToScheme(gardenScheme)
+		gardenScheme := runtime.NewScheme()
+		if err := gardencorev1beta1.AddToScheme(gardenScheme); err != nil {
+			a.gardenClientErr = fmt.Errorf("add garden scheme: %w", err)
+			return
+		}
 
-	c, err := client.New(restConfig, client.Options{Scheme: gardenScheme})
-	if err != nil {
-		return nil, fmt.Errorf("create garden client: %w", err)
-	}
-
-	return c, nil
+		c, err := client.New(restConfig, client.Options{Scheme: gardenScheme})
+		if err != nil {
+			a.gardenClientErr = fmt.Errorf("create garden client: %w", err)
+			return
+		}
+		a.gardenClient = c
+	})
+	return a.gardenClient, a.gardenClientErr
 }
 
 // isWebhookReady checks if the GRM namespace provisioner webhook is fully
@@ -1749,10 +1771,10 @@ func (a *actuator) extractShootMetadata(ctx context.Context, log logr.Logger, cl
 	}
 
 	// Extract node security group from Infrastructure status (AWS)
-	nodeSG := a.getNodeSecurityGroupFromInfraStatus(cluster, namespace)
+	nodeSG := a.getNodeSecurityGroupFromInfraStatus(ctx, cluster, namespace)
 
 	// Extract GCP node service account from Infrastructure status (GCP)
-	gcpNodeSA := a.getGCPNodeServiceAccountFromInfraStatus(cluster, namespace)
+	gcpNodeSA := a.getGCPNodeServiceAccountFromInfraStatus(ctx, cluster, namespace)
 
 	seedName := ""
 	if shoot.Spec.SeedName != nil {
@@ -1790,7 +1812,7 @@ func (a *actuator) extractShootMetadata(ctx context.Context, log logr.Logger, cl
 // the shoot's AWS infrastructure.
 //
 // Path: infrastructure.status.providerStatus.vpc.securityGroups[purpose=nodes].id
-func (a *actuator) getNodeSecurityGroupFromInfraStatus(cluster *extensionscontroller.Cluster, namespace string) string {
+func (a *actuator) getNodeSecurityGroupFromInfraStatus(ctx context.Context, cluster *extensionscontroller.Cluster, namespace string) string {
 	// The Cluster resource embeds the shoot but not the Infrastructure status.
 	// We need to read the Infrastructure CR directly from the seed.
 	infra := &extensionsv1alpha1.Infrastructure{}
@@ -1802,7 +1824,7 @@ func (a *actuator) getNodeSecurityGroupFromInfraStatus(cluster *extensionscontro
 		return ""
 	}
 
-	if err := a.client.Get(context.Background(), types.NamespacedName{
+	if err := a.client.Get(ctx, types.NamespacedName{
 		Name:      shootName,
 		Namespace: namespace,
 	}, infra); err != nil {
@@ -1943,7 +1965,7 @@ func (a *actuator) getGCPCloudProviderCredentials(ctx context.Context, namespace
 // stores this after creating the shoot's GCP infrastructure.
 //
 // Path: infrastructure.status.providerStatus.serviceAccountEmail
-func (a *actuator) getGCPNodeServiceAccountFromInfraStatus(cluster *extensionscontroller.Cluster, namespace string) string {
+func (a *actuator) getGCPNodeServiceAccountFromInfraStatus(ctx context.Context, cluster *extensionscontroller.Cluster, namespace string) string {
 	infra := &extensionsv1alpha1.Infrastructure{}
 	shootName := ""
 	if cluster.Shoot != nil {
@@ -1953,7 +1975,7 @@ func (a *actuator) getGCPNodeServiceAccountFromInfraStatus(cluster *extensionsco
 		return ""
 	}
 
-	if err := a.client.Get(context.Background(), types.NamespacedName{
+	if err := a.client.Get(ctx, types.NamespacedName{
 		Name:      shootName,
 		Namespace: namespace,
 	}, infra); err != nil {
@@ -2234,7 +2256,7 @@ func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon 
 	var rendered *gardenerchartrenderer.RenderedChart
 
 	if addon.Chart.OCI != "" {
-		archive, err := a.pullOCIChart(addon)
+		archive, err := a.pullOCIChart(ctx, addon)
 		if err != nil {
 			return nil, nil, fmt.Errorf("pull OCI chart %s: %w", addon.Chart.OCI, err)
 		}
@@ -2281,7 +2303,7 @@ func (a *actuator) renderAddonChartWithHooks(ctx context.Context, log logr.Logge
 	var result *hookaware.RenderResult
 
 	if addon.Chart.OCI != "" {
-		archive, err := a.pullOCIChart(addon)
+		archive, err := a.pullOCIChart(ctx, addon)
 		if err != nil {
 			return nil, nil, fmt.Errorf("pull OCI chart %s: %w", addon.Chart.OCI, err)
 		}
@@ -2585,14 +2607,24 @@ func (a *actuator) applyOneTimeJobs(ctx context.Context, log logr.Logger, restCo
 
 				// Spec changed (chart upgrade) — delete old Job and recreate
 				log.Info("Hook Job spec changed, recreating", "addon", addonName, "job", jobName)
-				propagation := metav1.DeletePropagationBackground
+				propagation := metav1.DeletePropagationForeground
 				if err := directClient.Delete(ctx, existing, &client.DeleteOptions{
 					Raw: &metav1.DeleteOptions{PropagationPolicy: &propagation},
 				}); err != nil {
 					log.Info("Failed to delete old hook Job", "addon", addonName, "job", jobName, "error", err)
 					continue
 				}
-				time.Sleep(2 * time.Second)
+				// Poll until the old Job is fully deleted (foreground propagation
+				// ensures dependents are cleaned up first).
+				deleteDeadline := time.Now().Add(30 * time.Second)
+				for time.Now().Before(deleteDeadline) {
+					check := &unstructured.Unstructured{}
+					check.SetGroupVersionKind(existing.GroupVersionKind())
+					if err := directClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: namespace}, check); err != nil {
+						break // deleted
+					}
+					time.Sleep(1 * time.Second)
+				}
 			}
 
 			// Create the Job
@@ -2737,8 +2769,17 @@ func (a *actuator) executeShootDeleteHooks(ctx context.Context, log logr.Logger,
 	// - Job running → ResourcesProgressing (neither True nor False)
 	var hookErr error
 	deadline := time.Now().Add(time.Duration(timeout) * time.Second)
+	completed := false
 
-	for time.Now().Before(deadline) {
+	for time.Now().Before(deadline) && !completed {
+		select {
+		case <-ctx.Done():
+			hookErr = fmt.Errorf("context cancelled waiting for delete hook: %w", ctx.Err())
+			completed = true
+			continue
+		default:
+		}
+
 		mr := &resourcesv1alpha1.ManagedResource{}
 		mrKey := types.NamespacedName{Name: mrName, Namespace: controlPlaneNamespace}
 		if err := a.client.Get(ctx, mrKey, mr); err != nil {
@@ -2749,7 +2790,8 @@ func (a *actuator) executeShootDeleteHooks(ctx context.Context, log logr.Logger,
 				continue
 			}
 			hookErr = fmt.Errorf("get delete hook MR: %w", err)
-			break
+			completed = true
+			continue
 		}
 
 		var applied, healthy, unhealthy bool
@@ -2765,18 +2807,20 @@ func (a *actuator) executeShootDeleteHooks(ctx context.Context, log logr.Logger,
 
 		if applied && healthy {
 			log.Info("Shoot delete hook completed", "addon", addonName, "hookType", hookType)
-			break
+			completed = true
+			continue
 		}
 		if applied && unhealthy {
 			hookErr = fmt.Errorf("shoot delete hook Job failed for addon %s", addonName)
 			log.Info("Shoot delete hook failed", "addon", addonName, "hookType", hookType)
-			break
+			completed = true
+			continue
 		}
 
 		time.Sleep(5 * time.Second)
 	}
 
-	if hookErr == nil && time.Now().After(deadline) {
+	if !completed {
 		hookErr = fmt.Errorf("shoot delete hook timed out after %ds for addon %s", timeout, addonName)
 		log.Info("Shoot delete hook timed out", "addon", addonName, "hookType", hookType, "timeout", timeout)
 	}
@@ -2890,6 +2934,15 @@ func (a *actuator) waitForHookJobs(ctx context.Context, log logr.Logger, c clien
 		deadline := time.Now().Add(time.Duration(timeout) * time.Second)
 		completed := false
 		for time.Now().Before(deadline) {
+			select {
+			case <-ctx.Done():
+				errs = append(errs, fmt.Errorf("context cancelled waiting for Job %s: %w", jobName, ctx.Err()))
+				completed = true
+			default:
+			}
+			if completed {
+				break
+			}
 			if err := c.Get(ctx, types.NamespacedName{Name: jobName, Namespace: namespace}, job); err != nil {
 				errs = append(errs, fmt.Errorf("get Job %s: %w", jobName, err))
 				completed = true
@@ -2970,12 +3023,12 @@ func loadEmbeddedChart(efs fs.ReadFileFS, chartPath string) (*helmchart.Chart, e
 }
 
 // pullOCIChart pulls a chart from OCI with fallback to cache.
-func (a *actuator) pullOCIChart(addon *addonpkg.Addon) ([]byte, error) {
+func (a *actuator) pullOCIChart(ctx context.Context, addon *addonpkg.Addon) ([]byte, error) {
 	if a.chartPuller == nil {
 		return nil, fmt.Errorf("OCI puller not initialized — cannot pull chart %s", addon.Chart.OCI)
 	}
 
-	result, err := a.chartPuller.Pull(context.Background(), addon.Chart.OCI, addon.Chart.Version)
+	result, err := a.chartPuller.Pull(ctx, addon.Chart.OCI, addon.Chart.Version)
 	if err != nil {
 		return nil, err
 	}

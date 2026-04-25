@@ -194,7 +194,9 @@ func (a *actuator) Reconcile(ctx context.Context, log logr.Logger, ex *extension
 	// Deploy seed-targeted addons when manifest changes.
 	// Pass prevStatus so seed cleanup can skip delete hooks for addons
 	// that also have shoot-class MRs (the shoot removal path handles them).
-	a.reconcileSeedAddons(ctx, log, ex.Namespace, meta.ProviderType, manifest, configMapValues, prevStatus)
+	if err := a.reconcileSeedAddons(ctx, log, ex.Namespace, meta.ProviderType, manifest, configMapValues, prevStatus); err != nil {
+		return fmt.Errorf("failed to reconcile seed addons: %w", err)
+	}
 
 	// Resolve per-shoot config from the Extension CR's providerConfig
 	cfg, err := config.ResolveConfig(ex)
@@ -753,14 +755,149 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 	return nil
 }
 
-// ForceDelete delegates to Delete.
+// ForceDelete performs a fast cleanup: deletes MRs and cloud resources but
+// skips hook execution and long waits (VPC endpoint deletion polling).
+// Gardener calls this when a shoot is force-deleted and needs fast cleanup.
 func (a *actuator) ForceDelete(ctx context.Context, log logr.Logger, ex *extensionsv1alpha1.Extension) error {
-	return a.Delete(ctx, log, ex)
+	cluster, err := extensionscontroller.GetCluster(ctx, a.client, ex.Namespace)
+	if err != nil {
+		return fmt.Errorf("failed to get cluster: %w", err)
+	}
+
+	meta, err := a.extractShootMetadata(ctx, log, cluster, ex.Namespace)
+	if err != nil {
+		return fmt.Errorf("failed to extract shoot metadata: %w", err)
+	}
+
+	manifest, _, err := a.loadAddonConfig(ctx, log, ex.Namespace)
+	if err != nil {
+		return fmt.Errorf("failed to load addon config: %w", err)
+	}
+	if manifest == nil {
+		return nil
+	}
+
+	prevStatus, err := config.GetPreviousStatus(ex)
+	if err != nil {
+		prevStatus = &config.ProviderStatus{}
+	}
+
+	log = log.WithValues("shoot", meta.Name, "operation", "force-delete")
+	var errs []error
+
+	// Delete MRs (skip hooks — force-delete must be fast)
+	for i := range manifest.Addons {
+		addon := &manifest.Addons[i]
+		mrName := addon.GetManagedResourceName()
+		if err := a.deleteManagedResource(ctx, ex.Namespace, mrName); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	_ = a.deleteManagedResource(ctx, ex.Namespace, mrNamespace)
+	if len(manifest.RegistrySecrets) > 0 {
+		_ = a.deleteManagedResource(ctx, ex.Namespace, mrRegistrySecrets)
+	}
+
+	// AWS cleanup (skip VPC endpoint deletion wait)
+	if meta.ProviderType == "aws" {
+		creds, err := a.getCloudProviderCredentials(ctx, ex.Namespace)
+		if err == nil {
+			awsClient, err := awsutil.NewClient(creds, meta.Region)
+			if err == nil {
+				if prevStatus.VPCEndpoint != nil && prevStatus.VPCEndpoint.VPCID != "" {
+					nodeSG := prevStatus.VPCEndpoint.NodeSecurityGroupID
+					if nodeSG == "" {
+						nodeSG = meta.NodeSecurityGroup
+					}
+					if prevStatus.VPCEndpoint.VPCID != "" && nodeSG != "" {
+						_, _ = awsClient.CleanupVPCEndpoint(ctx, prevStatus.VPCEndpoint.VPCID, meta.Region, nodeSG, meta.ControlNamespace)
+						// Skip WaitForVPCEndpointDeletion — force-delete must be fast
+					}
+				}
+				if manifest.GlobalAWS != nil {
+					for _, policyName := range manifest.GlobalAWS.IAMPolicies {
+						policyARN := fmt.Sprintf("arn:%s:iam::aws:policy/%s", meta.Partition, policyName)
+						_ = awsClient.DetachRolePolicy(ctx, meta.NodeRoleName, policyARN)
+					}
+				}
+			}
+		}
+	}
+
+	// GCP cleanup
+	if meta.ProviderType == "gcp" {
+		gcpCreds, err := a.getGCPCloudProviderCredentials(ctx, ex.Namespace)
+		if err == nil {
+			gcpClient, err := gcputil.NewClient(gcpCreds)
+			if err == nil {
+				nodeServiceAccount := meta.GCPNodeServiceAccount
+				if nodeServiceAccount == "" && prevStatus != nil {
+					nodeServiceAccount = prevStatus.GCPNodeServiceAccount
+				}
+				if nodeServiceAccount != "" {
+					member := fmt.Sprintf("serviceAccount:%s", nodeServiceAccount)
+					if manifest.GlobalGCP != nil {
+						for _, role := range manifest.GlobalGCP.IAMRoles {
+							_ = gcpClient.RemoveIAMPolicyBinding(ctx, member, role)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("force-delete encountered %d error(s), first: %w", len(errs), errs[0])
+	}
+	log.Info("Force-delete complete")
+	return nil
 }
 
-// Migrate delegates to Delete (resources will be re-created on the new seed).
+// Migrate cleans up seed-local resources (ManagedResources) but preserves
+// cloud provider resources (IAM policies, VPC endpoints, GCP IAM bindings).
+// During control plane migration, the shoot still exists on a different seed
+// and those resources should be preserved for the new seed to manage.
 func (a *actuator) Migrate(ctx context.Context, log logr.Logger, ex *extensionsv1alpha1.Extension) error {
-	return a.Delete(ctx, log, ex)
+	manifest, _, err := a.loadAddonConfig(ctx, log, ex.Namespace)
+	if err != nil {
+		return fmt.Errorf("failed to load addon config: %w", err)
+	}
+	if manifest == nil {
+		return nil
+	}
+
+	log = log.WithValues("operation", "migrate", "namespace", ex.Namespace)
+	var errs []error
+
+	// Delete ManagedResources for all addons (seed-local only)
+	for i := range manifest.Addons {
+		addon := &manifest.Addons[i]
+		mrName := addon.GetManagedResourceName()
+		if err := a.deleteManagedResource(ctx, ex.Namespace, mrName); err != nil {
+			log.Error(err, "Failed to delete ManagedResource during migrate", "addon", addon.Name)
+			errs = append(errs, err)
+		}
+	}
+
+	// Delete namespace and registry secret MRs
+	if err := a.deleteManagedResource(ctx, ex.Namespace, mrNamespace); err != nil {
+		errs = append(errs, err)
+	}
+	for _, oldName := range oldNamespaceMRNames {
+		_ = a.deleteManagedResource(ctx, ex.Namespace, oldName)
+	}
+	if len(manifest.RegistrySecrets) > 0 {
+		if err := a.deleteManagedResource(ctx, ex.Namespace, mrRegistrySecrets); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("migrate encountered %d error(s), first: %w", len(errs), errs[0])
+	}
+
+	log.Info("Migration complete — MRs deleted, cloud resources preserved for new seed")
+	return nil
 }
 
 // Restore delegates to Reconcile.
@@ -1068,7 +1205,7 @@ func getExtensionNamespace() string {
 // reconcileSeedAddons deploys addons with target "seed" or "global" to the
 // seed/runtime cluster as seed-class ManagedResources. Uses hash-based change
 // detection to redeploy when the manifest changes (e.g., ConfigMap update).
-func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, namespace string, providerType string, manifest *addonpkg.AddonManifest, configMapValues map[string]string, prevStatus *config.ProviderStatus) {
+func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, namespace string, providerType string, manifest *addonpkg.AddonManifest, configMapValues map[string]string, prevStatus *config.ProviderStatus) error {
 	// On managed seeds, the parent seed's extension already deploys addons via
 	// shoot-class ManagedResources into the shoot cluster (which IS the managed
 	// seed). Skip seed addon deployment to avoid duplicates.
@@ -1100,7 +1237,7 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 				}
 			}
 		}
-		return
+		return nil
 	}
 
 	extensionNS := getExtensionNamespace()
@@ -1165,6 +1302,7 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 	var rendered []renderedAddon
 	h := sha256.New()
 
+	var renderErrs []error
 	for i := range manifest.Addons {
 		addon := &manifest.Addons[i]
 		if !addon.DeploysToSeed() || !addon.Enabled {
@@ -1173,7 +1311,7 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 
 		secretData, _, err := a.renderAddonChart(ctx, log, addon, meta, manifest, configMapValues, nil)
 		if err != nil {
-			log.Error(err, "Failed to render seed addon chart", "addon", addon.Name)
+			renderErrs = append(renderErrs, fmt.Errorf("render seed addon %s: %w", addon.Name, err))
 			continue
 		}
 
@@ -1194,12 +1332,16 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 		}
 	}
 
+	if len(renderErrs) > 0 {
+		return fmt.Errorf("seed addon render errors: %v", renderErrs)
+	}
+
 	outputHash := fmt.Sprintf("%x", h.Sum(nil))[:16]
 
 	a.mu.Lock()
 	if a.seedAddonsHash == outputHash {
 		a.mu.Unlock()
-		return // No change since last reconciliation
+		return nil // No change since last reconciliation
 	}
 	a.seedAddonsHash = outputHash
 	a.mu.Unlock()
@@ -1221,8 +1363,7 @@ metadata:
 `, targetNS)),
 	}
 	if err := managedresources.CreateForSeed(ctx, a.client, namespace, mrNamespaceSeed, false, nsData); err != nil {
-		log.Error(err, "Failed to deploy seed addon namespace")
-		return
+		return fmt.Errorf("deploy seed addon namespace: %w", err)
 	}
 
 	// Deploy registry secrets to seed namespace so seed-side pods
@@ -1259,6 +1400,7 @@ metadata:
 	a.cleanupRemovedSeedAddons(ctx, log, namespace, targetNS, currentSeedAddonMap, prevStatus)
 
 	log.Info("Seed addon reconciliation complete")
+	return nil
 }
 
 // --------------------------------------------------------------------------

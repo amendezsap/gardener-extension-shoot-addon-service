@@ -1291,17 +1291,56 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 	a.seedJobHashes = a.readSeedJobHashes(ctx, extensionNS)
 	a.mu.Unlock()
 
-	// Render all seed addon charts first, then hash the rendered output.
-	// This ensures any change — manifest, config values, template variables,
-	// or code — triggers re-deployment.
+	// Compute a change-detection hash from the INPUTS (not rendered output).
+	// Helm's template engine produces non-deterministic YAML for Go maps
+	// (toYaml doesn't sort keys), so hashing the rendered output would differ
+	// on every reconcile even when nothing changed. Instead, hash the inputs
+	// that determine the output: ConfigMap values, chart versions, seed
+	// provider, and addon configuration.
+	h := sha256.New()
+	if configMapValues != nil {
+		cmKeys := make([]string, 0, len(configMapValues))
+		for k := range configMapValues {
+			cmKeys = append(cmKeys, k)
+		}
+		sort.Strings(cmKeys)
+		for _, k := range cmKeys {
+			h.Write([]byte(k))
+			h.Write([]byte(configMapValues[k]))
+		}
+	}
+	h.Write([]byte(meta.ProviderType))
+	h.Write([]byte(meta.SeedName))
+	h.Write([]byte(meta.Region))
+	h.Write([]byte(meta.ManagedKubernetesProvider))
+	for i := range manifest.Addons {
+		addon := &manifest.Addons[i]
+		if !addon.DeploysToSeed() || !addon.Enabled {
+			continue
+		}
+		h.Write([]byte(addon.Name))
+		h.Write([]byte(addon.Chart.OCI))
+		h.Write([]byte(addon.Chart.Version))
+		h.Write([]byte(addon.Chart.Path))
+	}
+	outputHash := fmt.Sprintf("%x", h.Sum(nil))[:16]
+
+	// Render all seed addon charts.
 	type renderedAddon struct {
 		addon      *addonpkg.Addon
 		mrName     string
 		secretData map[string][]byte
 	}
-	var rendered []renderedAddon
-	h := sha256.New()
 
+	// Check hash before rendering — skip if inputs haven't changed.
+	a.mu.Lock()
+	if a.seedAddonsHash == outputHash {
+		a.mu.Unlock()
+		return nil // No change since last reconciliation
+	}
+	a.mu.Unlock()
+
+	var rendered []renderedAddon
 	var renderErrs []error
 	for i := range manifest.Addons {
 		addon := &manifest.Addons[i]
@@ -1317,32 +1356,13 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 
 		mrName := addon.GetSeedManagedResourceName()
 		rendered = append(rendered, renderedAddon{addon, mrName, secretData})
-
-		// Hash the rendered output for change detection.
-		// Keys must be sorted — Go map iteration order is random, and
-		// an unstable hash causes spurious redeployments every reconcile.
-		secretKeys := make([]string, 0, len(secretData))
-		for k := range secretData {
-			secretKeys = append(secretKeys, k)
-		}
-		sort.Strings(secretKeys)
-		for _, k := range secretKeys {
-			h.Write([]byte(k))
-			h.Write(secretData[k])
-		}
 	}
 
 	if len(renderErrs) > 0 {
 		return fmt.Errorf("seed addon render errors: %v", renderErrs)
 	}
 
-	outputHash := fmt.Sprintf("%x", h.Sum(nil))[:16]
-
 	a.mu.Lock()
-	if a.seedAddonsHash == outputHash {
-		a.mu.Unlock()
-		return nil // No change since last reconciliation
-	}
 	a.seedAddonsHash = outputHash
 	a.mu.Unlock()
 

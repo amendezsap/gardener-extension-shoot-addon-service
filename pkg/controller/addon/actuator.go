@@ -178,6 +178,13 @@ func (a *actuator) Reconcile(ctx context.Context, log logr.Logger, ex *extension
 		return fmt.Errorf("failed to extract shoot metadata: %w", err)
 	}
 
+	// When the shoot is hibernated its worker nodes are gone, so addon workloads
+	// (Deployments/DaemonSets/StatefulSets) can never have available replicas.
+	// Mark those resources to skip GRM health checks so a hibernated shoot's addon
+	// MRs don't report perpetually unhealthy. Health checking resumes on wake.
+	hibernated := cluster.Shoot != nil && cluster.Shoot.Spec.Hibernation != nil &&
+		cluster.Shoot.Spec.Hibernation.Enabled != nil && *cluster.Shoot.Spec.Hibernation.Enabled
+
 	// Load addon config from ConfigMap (runtime) or embedded FS (fallback)
 	manifest, configMapValues, err := a.loadAddonConfig(ctx, log, ex.Namespace)
 	if err != nil {
@@ -421,6 +428,15 @@ metadata:
 		secretData, shootHookJobs, err := a.renderAddonChart(ctx, log, addon, meta, manifest, configMapValues, addonOverride)
 		if err != nil {
 			return fmt.Errorf("failed to render chart for addon %s: %w", addon.Name, err)
+		}
+
+		// On hibernated shoots, exclude addon workloads from GRM health checks
+		// (their 0 available replicas are expected, not a failure).
+		if hibernated {
+			secretData, err = skipHealthCheckForWorkloads(secretData)
+			if err != nil {
+				return fmt.Errorf("failed to annotate addon %s for hibernation: %w", addon.Name, err)
+			}
 		}
 
 		// Apply shoot-side hook Jobs via temporary MR with spec hash dedup.
@@ -3199,6 +3215,44 @@ func parseManifest(data []byte) ([]*unstructured.Unstructured, error) {
 		}
 	}
 	return result, nil
+}
+
+// skipHealthCheckForWorkloads adds the GRM annotation
+// resources.gardener.cloud/skip-health-check=true to workload resources
+// (Deployment/DaemonSet/StatefulSet) in the rendered ManagedResource data.
+// Used for hibernated shoots, where these workloads legitimately have zero
+// available replicas (no worker nodes) and must not be reported unhealthy.
+func skipHealthCheckForWorkloads(secretData map[string][]byte) (map[string][]byte, error) {
+	const skipHealthCheckAnnotation = "resources.gardener.cloud/skip-health-check"
+	workloadKinds := map[string]bool{"Deployment": true, "DaemonSet": true, "StatefulSet": true}
+
+	out := make(map[string][]byte, len(secretData))
+	for key, data := range secretData {
+		objs, err := parseManifest(data)
+		if err != nil {
+			// Leave unparseable documents untouched rather than dropping them.
+			out[key] = data
+			continue
+		}
+		docs := make([][]byte, 0, len(objs))
+		for _, obj := range objs {
+			if workloadKinds[obj.GetKind()] {
+				ann := obj.GetAnnotations()
+				if ann == nil {
+					ann = map[string]string{}
+				}
+				ann[skipHealthCheckAnnotation] = "true"
+				obj.SetAnnotations(ann)
+			}
+			b, err := yamlutil.Marshal(obj.Object)
+			if err != nil {
+				return nil, fmt.Errorf("marshal object: %w", err)
+			}
+			docs = append(docs, b)
+		}
+		out[key] = bytes.Join(docs, []byte("---\n"))
+	}
+	return out, nil
 }
 
 // loadEmbeddedChart loads a chart from the embedded filesystem.

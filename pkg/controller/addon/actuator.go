@@ -111,9 +111,8 @@ type actuator struct {
 	chartPuller        *oci.ChartPuller
 	seedAddonsHash             string
 	seedJobHashes              map[string]string // addonName/jobKey → specHash, persisted in ConfigMap
-	gardenClient               client.Client     // cached garden (virtual) cluster client
-	gardenClientErr            error             // cached error from garden client creation
-	gardenClientOnce           sync.Once
+	gardenClient               client.Client     // cached garden (virtual) cluster client (memoized on success only)
+	gardenClientMu             sync.Mutex        // guards lazy garden client creation
 	managedSeedChecked         bool
 	managedSeedResult          bool
 	seedProviderType           string
@@ -121,6 +120,10 @@ type actuator struct {
 	managedKubernetesProvider  string
 	managedKubernetesChecked   bool
 	mu                         sync.Mutex
+
+	// checkManagedSeedFn, when set, overrides the managed-seed determination.
+	// Used only in tests to avoid needing a real seed API server.
+	checkManagedSeedFn func(context.Context, logr.Logger, string) (bool, bool)
 }
 
 // NewActuator creates a new actuator.
@@ -421,15 +424,14 @@ metadata:
 		}
 
 		// Apply shoot-side hook Jobs via temporary MR with spec hash dedup.
-		// Jobs run once, temp MR is deleted, hash recorded in status.
-		// If transitioning from an older version (HookJobsCompleted never
-		// set but addon was previously deployed), skip the temp MR — the
-		// Job already ran under the old version. Creating a temp MR during
-		// transition would conflict with the persistent MR's cleanup of
-		// the old Job resource.
+		// Jobs run once (non-blocking, via GRM), temp MR is deleted, hash
+		// recorded in status. If no hash is recorded yet, the Job runs — this
+		// is safe to do idempotently and is required so that hook Jobs which
+		// never actually completed (new shoots, new seeds, or a Job that
+		// failed before its hash was recorded) are re-run instead of being
+		// silently marked done.
 		if len(shootHookJobs) > 0 {
-			previouslyDeployed := prevStatus != nil && prevStatus.Addons != nil && prevStatus.Addons[addon.Name] != nil
-			a.applyShootHookJobs(ctx, log, ex.Namespace, addon.Name, shootHookJobs, addonStatus, previouslyDeployed)
+			a.applyShootHookJobs(ctx, log, ex.Namespace, addon.Name, shootHookJobs, addonStatus)
 		}
 
 		log.Info("Deploying addon ManagedResource", "addon", addon.Name, "managedResource", mrName, "targetNamespace", ns)
@@ -989,7 +991,21 @@ func (a *actuator) isManagedSeed(ctx context.Context, log logr.Logger, seedName 
 	}
 	a.mu.Unlock()
 
-	result := a.checkManagedSeed(ctx, log, seedName)
+	check := a.checkManagedSeed
+	if a.checkManagedSeedFn != nil {
+		check = a.checkManagedSeedFn
+	}
+	result, authoritative := check(ctx, log, seedName)
+	if !authoritative {
+		// The garden API could not be consulted (client not ready at startup or a
+		// transient error). Do NOT cache — retry on the next reconcile once the
+		// garden API is reachable. Caching a non-authoritative "false" here is what
+		// caused managed seeds to be permanently misclassified for the pod's whole
+		// lifetime, spuriously deploying seed-class addons into every shoot
+		// control-plane namespace.
+		log.Info("Managed-seed status undetermined, will retry next reconcile", "seedName", seedName, "assuming", result)
+		return result
+	}
 
 	a.mu.Lock()
 	a.managedSeedChecked = true
@@ -999,40 +1015,52 @@ func (a *actuator) isManagedSeed(ctx context.Context, log logr.Logger, seedName 
 	return result
 }
 
-func (a *actuator) checkManagedSeed(ctx context.Context, log logr.Logger, seedName string) bool {
-	gardenClient, err := a.getGardenClient()
+// checkManagedSeed reports whether the seed is also a Gardener shoot (a managed
+// seed). The second return value is true only when the determination is
+// authoritative; callers MUST NOT cache a result when it is false.
+//
+// Detection uses a LOCAL signal on the seed cluster: gardenlet injects a
+// kube-system/shoot-info ConfigMap into every shoot, so a managed seed (which is
+// itself a shoot) has it, while a raw runtime seed — where gardener-operator
+// runs, e.g. a GKE/EKS cluster — does not.
+//
+// This deliberately does NOT query the garden API for the seed's own Shoot
+// object: the Gardener seed authorizer forbids that with "no relationship found"
+// (a managed seed is hosted by its parent seed, not by itself), so the garden
+// query can never succeed from a managed seed and would leave it permanently
+// misclassified as "not managed" — spuriously deploying seed-class addons.
+func (a *actuator) checkManagedSeed(ctx context.Context, log logr.Logger, seedName string) (isManaged bool, authoritative bool) {
+	// Use a direct (uncached) client so the controller-runtime cache does not
+	// set up a cluster-wide ConfigMap watch on the seed (seeds hold many
+	// ConfigMaps). Reads use the extension's seed ServiceAccount, which already
+	// has get on ConfigMaps.
+	directClient, err := client.New(a.restConfig, client.Options{})
 	if err != nil {
-		return false
+		log.Info("Failed to create client for managed-seed detection", "seedName", seedName, "error", err)
+		return false, false
+	}
+	return checkManagedSeedFromCluster(ctx, log, directClient, seedName)
+}
+
+// checkManagedSeedFromCluster performs the shoot-info lookup against a seed
+// cluster reader. Split out from checkManagedSeed so the detection logic can be
+// unit-tested with a fake client.
+func checkManagedSeedFromCluster(ctx context.Context, log logr.Logger, reader client.Reader, seedName string) (isManaged bool, authoritative bool) {
+	cm := &corev1.ConfigMap{}
+	err := reader.Get(ctx, types.NamespacedName{Namespace: metav1.NamespaceSystem, Name: "shoot-info"}, cm)
+	if err == nil {
+		log.Info("Seed is a managed seed (kube-system/shoot-info present)", "seedName", seedName)
+		return true, true
+	}
+	if apierrors.IsNotFound(err) {
+		// No shoot-info ConfigMap → this is a raw runtime seed, not a managed seed.
+		return false, true
 	}
 
-	// Check if this seed is also a shoot by trying to find a Shoot with
-	// the same name. Try the "garden" namespace first (default project,
-	// covers most managed seeds). This is O(1) instead of listing all shoots.
-	shoot := &gardencorev1beta1.Shoot{}
-	if err := gardenClient.Get(ctx, types.NamespacedName{Name: seedName, Namespace: "garden"}, shoot); err == nil {
-		log.Info("Seed is a managed seed (shoot exists with same name)",
-			"seedName", seedName, "shootNamespace", "garden")
-		return true
-	}
-
-	// If not found in "garden", the shoot may be in a different project namespace.
-	// List shoots filtered by name across all namespaces.
-	shootList := &gardencorev1beta1.ShootList{}
-	if err := gardenClient.List(ctx, shootList, client.MatchingFields{"metadata.name": seedName}); err != nil {
-		// Field selector may not be indexed — default to false (safe — seed addons
-		// run unnecessarily rather than being skipped).
-		return false
-	}
-
-	for _, s := range shootList.Items {
-		if s.Name == seedName {
-			log.Info("Seed is a managed seed (shoot exists with same name)",
-				"seedName", seedName, "shootNamespace", s.Namespace)
-			return true
-		}
-	}
-
-	return false
+	// Any other error (transient, RBAC) → not authoritative; retry next reconcile
+	// rather than caching a wrong "not a managed seed".
+	log.Info("Could not read kube-system/shoot-info for managed-seed detection", "seedName", seedName, "error", err)
+	return false, false
 }
 
 // getSeedProviderType returns the provider type of the seed/runtime cluster by
@@ -1800,36 +1828,43 @@ func (a *actuator) triggerShootReconcile(ctx context.Context, log logr.Logger, m
 	log.Info("Triggered shoot reconcile via garden API", "shoot", shootKey)
 }
 
-// getGardenClient returns a cached client for the garden (virtual) cluster
-// using the kubeconfig injected by gardenlet. Created once via sync.Once.
+// getGardenClient returns a client for the garden (virtual) cluster using the
+// kubeconfig injected by gardenlet. The client is memoized ONLY on success — a
+// transient failure (e.g. GARDEN_KUBECONFIG not yet mounted at startup) is
+// returned to the caller and retried on the next call. This is deliberately not
+// a sync.Once: a one-time startup error must not permanently disable garden API
+// access for the pod's whole lifetime (which previously wedged managed-seed
+// detection into a false result — see isManagedSeed).
 func (a *actuator) getGardenClient() (client.Client, error) {
-	a.gardenClientOnce.Do(func() {
-		kubeconfigPath := os.Getenv("GARDEN_KUBECONFIG")
-		if kubeconfigPath == "" {
-			a.gardenClientErr = fmt.Errorf("GARDEN_KUBECONFIG not set")
-			return
-		}
+	a.gardenClientMu.Lock()
+	defer a.gardenClientMu.Unlock()
 
-		restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
-		if err != nil {
-			a.gardenClientErr = fmt.Errorf("build garden REST config: %w", err)
-			return
-		}
+	if a.gardenClient != nil {
+		return a.gardenClient, nil
+	}
 
-		gardenScheme := runtime.NewScheme()
-		if err := gardencorev1beta1.AddToScheme(gardenScheme); err != nil {
-			a.gardenClientErr = fmt.Errorf("add garden scheme: %w", err)
-			return
-		}
+	kubeconfigPath := os.Getenv("GARDEN_KUBECONFIG")
+	if kubeconfigPath == "" {
+		return nil, fmt.Errorf("GARDEN_KUBECONFIG not set")
+	}
 
-		c, err := client.New(restConfig, client.Options{Scheme: gardenScheme})
-		if err != nil {
-			a.gardenClientErr = fmt.Errorf("create garden client: %w", err)
-			return
-		}
-		a.gardenClient = c
-	})
-	return a.gardenClient, a.gardenClientErr
+	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	if err != nil {
+		return nil, fmt.Errorf("build garden REST config: %w", err)
+	}
+
+	gardenScheme := runtime.NewScheme()
+	if err := gardencorev1beta1.AddToScheme(gardenScheme); err != nil {
+		return nil, fmt.Errorf("add garden scheme: %w", err)
+	}
+
+	c, err := client.New(restConfig, client.Options{Scheme: gardenScheme})
+	if err != nil {
+		return nil, fmt.Errorf("create garden client: %w", err)
+	}
+
+	a.gardenClient = c
+	return c, nil
 }
 
 // isWebhookReady checks if the GRM namespace provisioner webhook is fully
@@ -2574,7 +2609,7 @@ func (a *actuator) applyHookSecrets(ctx context.Context, log logr.Logger, restCo
 //   - Next reconcile: MR healthy → hash recorded, temp MR deleted
 //   - Subsequent reconciles: hash matches → skip (<1ms)
 //   - Chart upgrade: hash differs → new temp MR (non-blocking)
-func (a *actuator) applyShootHookJobs(ctx context.Context, log logr.Logger, controlPlaneNamespace, addonName string, jobs [][]byte, addonStatus *config.AddonStatus, previouslyDeployed bool) {
+func (a *actuator) applyShootHookJobs(ctx context.Context, log logr.Logger, controlPlaneNamespace, addonName string, jobs [][]byte, addonStatus *config.AddonStatus) {
 	prevHashes := addonStatus.HookJobsCompleted
 	newHashes := make(map[string]string, len(jobs))
 
@@ -2591,19 +2626,22 @@ func (a *actuator) applyShootHookJobs(ctx context.Context, log logr.Logger, cont
 			}
 		}
 
-		// Transition path: addon was previously deployed but HookJobsCompleted
-		// was never set (upgrading from v0.6.x where Jobs were in the persistent
-		// MR). The Job already ran under the old version. Don't create a temp MR
-		// — it would conflict with GRM's cleanup of the old Job from the
-		// persistent MR (circular dependency: persistent MR deletes Job, temp MR
-		// recreates it, GRM loops forever).
-		if prevHashes == nil && previouslyDeployed {
-			log.Info("Transition: recording hook Job hash without running (already completed under previous version)", "addon", addonName, "job", jobKey)
-			newHashes[jobKey] = specHash
-			// Clean up any stale temp MR from a failed previous attempt
-			_ = managedresources.DeleteForShoot(ctx, a.client, controlPlaneNamespace, mrName)
-			continue
-		}
+		// No recorded hash for this Job → it has not been observed to
+		// complete under this version. Fall through to the temp-MR state
+		// machine below, which runs the Job (non-blocking) and only records
+		// the hash once GRM reports the temp MR applied+terminal.
+		//
+		// NOTE: earlier versions had a "transition" shortcut here that, when
+		// prevHashes==nil and the addon was previously deployed, recorded the
+		// hash WITHOUT running the Job (assuming it had run under v0.6.x where
+		// hook Jobs lived in the persistent MR). That assumption is false for
+		// shoots first onboarded under v0.7.x, shoots migrated to a new seed,
+		// or any shoot whose Job failed before a hash was recorded: the Job
+		// was silently marked done and never ran, leaving whatever the Job was
+		// meant to create or populate (e.g. a Secret its addon's workloads
+		// consume) missing, which can crash those workloads. The v0.6.x→v0.7.x
+		// migration window is long closed, so the shortcut is removed; the
+		// normal path is idempotent and self-heals stuck Jobs.
 
 		// Check if a temp MR already exists (from a previous reconcile)
 		mr := &resourcesv1alpha1.ManagedResource{}

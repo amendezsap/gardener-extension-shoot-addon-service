@@ -2459,6 +2459,37 @@ func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon 
 	return a.renderAddonChartWithContext(ctx, log, addon, meta, manifest, configMapValues, perShootOverride, nil, "")
 }
 
+// injectSecretValues merges data from the addon's referenced seed Secrets into
+// the render values under each entry's ValuesKey. Non-secret values already set
+// under the key (e.g. a Secret name from shootValues) are preserved; the Secret's
+// string data is overlaid on top. Addons without SecretValues are unaffected.
+func (a *actuator) injectSecretValues(ctx context.Context, merged map[string]interface{}, addon *addonpkg.Addon) error {
+	for _, sv := range addon.SecretValues {
+		if sv.ValuesKey == "" || sv.SeedSecretRef.Name == "" {
+			continue
+		}
+		ns := sv.SeedSecretRef.Namespace
+		if ns == "" {
+			ns = getExtensionNamespace()
+		}
+		secret := &corev1.Secret{}
+		if err := a.client.Get(ctx, types.NamespacedName{Name: sv.SeedSecretRef.Name, Namespace: ns}, secret); err != nil {
+			return fmt.Errorf("read secretValues %s/%s for addon %s: %w", ns, sv.SeedSecretRef.Name, addon.Name, err)
+		}
+		data := map[string]interface{}{}
+		if existing, ok := merged[sv.ValuesKey].(map[string]interface{}); ok {
+			for k, v := range existing {
+				data[k] = v
+			}
+		}
+		for k, v := range secret.Data {
+			data[k] = string(v)
+		}
+		merged[sv.ValuesKey] = data
+	}
+	return nil
+}
+
 // renderAddonChartWithContext is renderAddonChart with two extra, additive knobs
 // used by the control-plane target to render the same chart twice:
 //   - extraValues: values merged LAST (highest precedence). Used to inject the
@@ -2551,6 +2582,15 @@ func (a *actuator) renderAddonChartWithContext(ctx context.Context, log logr.Log
 			// Merge (default) — additive, only specified keys change
 			merged = mergeMaps(merged, overrideVals)
 		}
+	}
+
+	// Inject values from Secrets on the seed. Keeps sensitive values (e.g.
+	// destination credentials) out of the addon manifest ConfigMap: only the
+	// Secret name/reference lives in config; the actual data is read here and
+	// merged into the render values, ending up only in the (Secret-backed)
+	// ManagedResource.
+	if err := a.injectSecretValues(ctx, merged, addon); err != nil {
+		return nil, nil, err
 	}
 
 	// Caller-provided render-context values (e.g. the renderTarget signal for

@@ -86,6 +86,12 @@ type Addon struct {
 	ShootValues         map[string]interface{} `json:"shootValues,omitempty" yaml:"shootValues,omitempty"`
 	Image               *ImageOverride         `json:"image,omitempty" yaml:"image,omitempty"`
 	ImagePullSecrets    []string               `json:"imagePullSecrets,omitempty" yaml:"imagePullSecrets,omitempty"`
+	// SecretValues injects data from Secrets on the seed into the addon's chart
+	// values at render time, so sensitive values (e.g. destination credentials)
+	// live only in a Secret and never appear in the addon manifest ConfigMap.
+	// Each entry reads the referenced seed Secret and merges its string data under
+	// ValuesKey (preserving any non-secret values already set there).
+	SecretValues []SecretValueRef `json:"secretValues,omitempty" yaml:"secretValues,omitempty"`
 	// KeepObjectsOnRename is reserved for future use. Legacy MR cleanup always
 	// uses keepObjects=true to preserve resources during MR name migration.
 	// The Helm release name is stable (addon name), so all resource types
@@ -233,6 +239,16 @@ type RegistrySecret struct {
 	Server string `json:"server,omitempty" yaml:"server,omitempty"`
 	// SeedSecretRef references the Secret on the seed cluster containing
 	// the actual registry credentials.
+	SeedSecretRef SeedSecretRef `json:"seedSecretRef" yaml:"seedSecretRef"`
+}
+
+// SecretValueRef injects a seed Secret's data into chart values under ValuesKey.
+// Used to keep sensitive values out of the addon manifest ConfigMap.
+type SecretValueRef struct {
+	// ValuesKey is the chart values key to merge the Secret's data under
+	// (e.g. "ecrCredentials"). The Secret's string data becomes the sub-keys.
+	ValuesKey string `json:"valuesKey" yaml:"valuesKey"`
+	// SeedSecretRef references the Secret on the seed to read.
 	SeedSecretRef SeedSecretRef `json:"seedSecretRef" yaml:"seedSecretRef"`
 }
 

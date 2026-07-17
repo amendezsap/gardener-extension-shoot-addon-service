@@ -119,11 +119,17 @@ func TestAddonTarget(t *testing.T) {
 		target       AddonTarget
 		deploysShoot bool
 		deploysSeed  bool
+		deploysCP    bool
 	}{
-		{"", true, false},           // default = shoot
-		{AddonTargetShoot, true, false},
-		{AddonTargetSeed, false, true},
-		{AddonTargetGlobal, true, true},
+		{"", true, false, false}, // default = shoot
+		{AddonTargetShoot, true, false, false},
+		{AddonTargetSeed, false, true, false},
+		{AddonTargetGlobal, true, true, false},
+		// controlplane is handled by its own reconcile branch. It must NOT be
+		// picked up by the shoot loop or reconcileSeedAddons, so both
+		// DeploysToShoot and DeploysToSeed must be false — otherwise an existing
+		// loop would render the full chart into the wrong MR.
+		{AddonTargetControlPlane, false, false, true},
 	}
 
 	for _, tt := range tests {
@@ -133,6 +139,9 @@ func TestAddonTarget(t *testing.T) {
 		}
 		if addon.DeploysToSeed() != tt.deploysSeed {
 			t.Errorf("target %q: DeploysToSeed() = %v, want %v", tt.target, addon.DeploysToSeed(), tt.deploysSeed)
+		}
+		if addon.DeploysToControlPlane() != tt.deploysCP {
+			t.Errorf("target %q: DeploysToControlPlane() = %v, want %v", tt.target, addon.DeploysToControlPlane(), tt.deploysCP)
 		}
 	}
 }

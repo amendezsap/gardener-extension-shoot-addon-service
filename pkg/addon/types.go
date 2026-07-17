@@ -58,15 +58,21 @@ type GlobalGCPConfig struct {
 }
 
 // AddonTarget specifies where an addon should be deployed.
-//   - "shoot"  — deploy to each shoot via shoot-class ManagedResource (default)
-//   - "seed"   — deploy once to the seed/runtime cluster via seed-class ManagedResource
-//   - "global" — deploy to both shoots and the seed/runtime cluster
+//   - "shoot"        — deploy to each shoot via shoot-class ManagedResource (default)
+//   - "seed"         — deploy once to the seed/runtime cluster via seed-class ManagedResource
+//   - "global"       — deploy to both shoots and the seed/runtime cluster
+//   - "controlplane" — deploy per shoot into that shoot's control-plane namespace ON THE
+//     seed (seed-class MR) for the controller workload, plus a shoot-class MR for the
+//     in-shoot RBAC. Used for controllers that run in the control plane and reach into the
+//     shoot via the token-requestor pattern. Unlike "seed", this is per-shoot and is NOT
+//     skipped on managed seeds.
 type AddonTarget string
 
 const (
-	AddonTargetShoot  AddonTarget = "shoot"
-	AddonTargetSeed   AddonTarget = "seed"
-	AddonTargetGlobal AddonTarget = "global"
+	AddonTargetShoot        AddonTarget = "shoot"
+	AddonTargetSeed         AddonTarget = "seed"
+	AddonTargetGlobal       AddonTarget = "global"
+	AddonTargetControlPlane AddonTarget = "controlplane"
 )
 
 type Addon struct {
@@ -175,6 +181,14 @@ func (a *Addon) DeploysToShoot() bool {
 func (a *Addon) DeploysToSeed() bool {
 	t := a.GetTarget()
 	return t == AddonTargetSeed || t == AddonTargetGlobal
+}
+
+// DeploysToControlPlane returns true if the addon is a per-shoot control-plane
+// addon (controller in the shoot's control-plane namespace on the seed + shoot
+// RBAC). Kept separate from DeploysToShoot/DeploysToSeed so the existing shoot
+// and seed reconcile loops never pick it up — it is handled by its own branch.
+func (a *Addon) DeploysToControlPlane() bool {
+	return a.GetTarget() == AddonTargetControlPlane
 }
 
 type ChartSource struct {

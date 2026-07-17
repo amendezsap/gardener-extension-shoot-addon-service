@@ -68,6 +68,13 @@ const (
 	mrNamespaceSeed       = addonpkg.ManagedResourcePrefix + "namespace-seed"
 	mrRegistrySecrets     = addonpkg.ManagedResourcePrefix + "registry-secrets"
 	mrRegistrySecretsSeed = addonpkg.ManagedResourcePrefix + "registry-secrets-seed"
+
+	// renderTargetValuesKey is the values key injected into a control-plane
+	// addon's chart so it can emit the control-plane workload (for the seed-class
+	// MR) and the in-shoot RBAC (for the shoot-class MR) from a single chart.
+	renderTargetValuesKey    = "renderTarget"
+	renderTargetControlPlane = "controlplane"
+	renderTargetShoot        = "shoot"
 )
 
 // Legacy MR names from previous versions that need cleanup.
@@ -456,6 +463,81 @@ metadata:
 		}
 	}
 
+	// Process control-plane-targeted addons.
+	//
+	// A control-plane addon runs its controller in the shoot's control-plane
+	// namespace ON THE SEED and reaches into the shoot via the token-requestor
+	// pattern. The extension renders the SAME chart twice with a renderTarget
+	// signal:
+	//   - renderTarget=controlplane -> controller Deployment + creds + token-requestor
+	//     Secret, deployed via a seed-class MR (CreateForSeed) into ex.Namespace,
+	//     i.e. the control-plane namespace on the seed.
+	//   - renderTarget=shoot -> namespace + ServiceAccount + read-only RBAC, deployed
+	//     via a shoot-class MR (CreateForShoot) into the shoot itself.
+	//
+	// This path is deliberately separate from the shoot loop and reconcileSeedAddons
+	// so those (and every existing shoot/seed/global addon) are entirely unaffected.
+	// Unlike target: seed, it is per-shoot and is NOT skipped on managed seeds.
+	for i := range manifest.Addons {
+		addon := &manifest.Addons[i]
+
+		if !addon.DeploysToControlPlane() {
+			continue
+		}
+		if !cfg.IsAddonEnabled(addon.Name, addon.Enabled) {
+			log.Info("Addon disabled, skipping", "addon", addon.Name)
+			continue
+		}
+
+		log.Info("Reconciling control-plane addon", "addon", addon.Name)
+
+		addonStatus := &config.AddonStatus{
+			ManagedResourceName: addon.GetManagedResourceName(),
+			Target:              string(addon.GetTarget()),
+			HasHooks:            addon.Hooks != nil && addon.Hooks.Include,
+		}
+		newStatus.Addons[addon.Name] = addonStatus
+
+		var addonOverride *config.AddonOverride
+		if cfg.Addons != nil {
+			if override, ok := cfg.Addons[addon.Name]; ok {
+				addonOverride = &override
+			}
+		}
+
+		// Control-plane half: controller workload into the CP namespace on the seed.
+		seedData, _, err := a.renderAddonChartWithContext(ctx, log, addon, meta, manifest, configMapValues, addonOverride,
+			map[string]interface{}{renderTargetValuesKey: renderTargetControlPlane}, meta.ControlNamespace)
+		if err != nil {
+			return fmt.Errorf("failed to render control-plane part for addon %s: %w", addon.Name, err)
+		}
+		// On hibernated shoots the controller can never have available replicas
+		// (no shoot to watch), so exclude its workload from GRM health checks.
+		if hibernated {
+			seedData, err = skipHealthCheckForWorkloads(seedData)
+			if err != nil {
+				return fmt.Errorf("failed to annotate control-plane addon %s for hibernation: %w", addon.Name, err)
+			}
+		}
+		seedMRName := addon.GetSeedManagedResourceName()
+		log.Info("Deploying control-plane ManagedResource", "addon", addon.Name, "managedResource", seedMRName, "targetNamespace", meta.ControlNamespace)
+		if err := managedresources.CreateForSeed(ctx, a.client, ex.Namespace, seedMRName, false, seedData); err != nil {
+			return fmt.Errorf("failed to deploy control-plane ManagedResource for addon %s: %w", addon.Name, err)
+		}
+
+		// Shoot half: namespace + ServiceAccount + read-only RBAC inside the shoot.
+		shootData, _, err := a.renderAddonChartWithContext(ctx, log, addon, meta, manifest, configMapValues, addonOverride,
+			map[string]interface{}{renderTargetValuesKey: renderTargetShoot}, addon.GetNamespace(manifest.DefaultNamespace))
+		if err != nil {
+			return fmt.Errorf("failed to render shoot RBAC for addon %s: %w", addon.Name, err)
+		}
+		shootMRName := addon.GetManagedResourceName()
+		log.Info("Deploying shoot RBAC ManagedResource", "addon", addon.Name, "managedResource", shootMRName)
+		if err := managedresources.CreateForShoot(ctx, a.client, ex.Namespace, shootMRName, "shoot-addon-service", false, shootData); err != nil {
+			return fmt.Errorf("failed to deploy shoot RBAC ManagedResource for addon %s: %w", addon.Name, err)
+		}
+	}
+
 	// Clean up legacy ManagedResource names from previous versions.
 	// All MRs use keepObjects=true — resources are preserved for the new MR to
 	// adopt. This avoids a race condition where the GRM deletes resources from
@@ -630,6 +712,17 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 		if err := a.deleteManagedResource(ctx, ex.Namespace, mrName); err != nil {
 			log.Error(err, "Failed to delete ManagedResource", "addon", addon.Name)
 			errs = append(errs, err)
+		}
+		// Control-plane addons also have a seed-class MR (the controller in the
+		// control-plane namespace on the seed). The loop above removed the shoot
+		// RBAC MR; remove the seed-class MR here.
+		if addon.DeploysToControlPlane() {
+			seedMRName := addon.GetSeedManagedResourceName()
+			log.Info("Deleting control-plane ManagedResource", "addon", addon.Name, "managedResource", seedMRName)
+			if err := managedresources.DeleteForSeed(ctx, a.client, ex.Namespace, seedMRName); err != nil {
+				log.Error(err, "Failed to delete control-plane ManagedResource", "addon", addon.Name)
+				errs = append(errs, err)
+			}
 		}
 	}
 
@@ -2363,6 +2456,20 @@ data:
 //	{{ .Region }}   -> meta.Region
 //	{{ .SeedName }} -> meta.SeedName
 func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon *addonpkg.Addon, meta *shootMetadata, manifest *addonpkg.AddonManifest, configMapValues map[string]string, perShootOverride *config.AddonOverride) (map[string][]byte, [][]byte, error) {
+	return a.renderAddonChartWithContext(ctx, log, addon, meta, manifest, configMapValues, perShootOverride, nil, "")
+}
+
+// renderAddonChartWithContext is renderAddonChart with two extra, additive knobs
+// used by the control-plane target to render the same chart twice:
+//   - extraValues: values merged LAST (highest precedence). Used to inject the
+//     renderTarget signal so a chart can emit control-plane resources for the
+//     seed-class MR and shoot RBAC for the shoot-class MR from one chart.
+//   - nsOverride: Helm release namespace override. When empty, falls back to the
+//     addon's configured namespace (original behavior).
+//
+// Passing (nil, "") reproduces the original renderAddonChart behavior exactly, so
+// existing callers are unaffected.
+func (a *actuator) renderAddonChartWithContext(ctx context.Context, log logr.Logger, addon *addonpkg.Addon, meta *shootMetadata, manifest *addonpkg.AddonManifest, configMapValues map[string]string, perShootOverride *config.AddonOverride, extraValues map[string]interface{}, nsOverride string) (map[string][]byte, [][]byte, error) {
 	merged := map[string]interface{}{}
 
 	if configMapValues != nil {
@@ -2446,7 +2553,17 @@ func (a *actuator) renderAddonChart(ctx context.Context, log logr.Logger, addon 
 		}
 	}
 
-	ns := addon.GetNamespace(manifest.DefaultNamespace)
+	// Caller-provided render-context values (e.g. the renderTarget signal for
+	// control-plane addons). Merged last so they always win over chart/manifest
+	// values and cannot be clobbered by a per-shoot override.
+	if len(extraValues) > 0 {
+		merged = mergeMaps(merged, extraValues)
+	}
+
+	ns := nsOverride
+	if ns == "" {
+		ns = addon.GetNamespace(manifest.DefaultNamespace)
+	}
 	// Use addon name as the Helm release name, NOT the MR name. The release
 	// name sets app.kubernetes.io/instance labels, which are immutable on
 	// DaemonSets. Changing the release name would break existing deployments.

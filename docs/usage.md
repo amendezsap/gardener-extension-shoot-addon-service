@@ -108,11 +108,12 @@ addons:
 | `chart.git` | Yes* | Git repository URL |
 | `valuesPath` | No | Path to values directory relative to `addons/` |
 | `enabled` | Yes | Default enabled state |
-| `target` | No | Deployment target: `shoot` (default), `seed`, or `global` |
+| `target` | No | Deployment target: `shoot` (default), `seed`, `global`, or `controlplane` |
 | `managedResourceName` | No | ManagedResource name (defaults to addon name) |
 | `shootValues` | No | Values merged into the chart at render time |
 | `image` | No | Image override configuration |
 | `imagePullSecrets` | No | List of pull secret names to inject |
+| `secretValues` | No | Inject data from seed Secrets into chart values at render time (see [Secret Values](#secret-values)) |
 | `namespace` | No | Override target namespace (defaults to `defaultNamespace`) |
 | `keepObjectsOnRename` | No | Reserved for future use. Legacy MR cleanup always preserves resources (`keepObjects=true`). |
 | `hooks` | No | Helm hook rendering configuration. See [docs/hooks.md](hooks.md) for details. |
@@ -167,6 +168,7 @@ Each addon has a `target` field that controls where it is deployed:
 | `shoot` | Deploy to each shoot's worker nodes (default) | shoot |
 | `seed` | Deploy once to the seed/runtime cluster | seed |
 | `global` | Deploy to both shoots and the seed cluster | both |
+| `controlplane` | Per-shoot controller in the shoot's control-plane namespace on the seed, plus in-shoot RBAC | seed + shoot |
 
 ### Shoot Target
 
@@ -182,6 +184,56 @@ Addons with `target: global` are deployed to both. The same chart and values are
 
 - **Shoot context:** `{{ .SeedName }}` = the seed managing the shoot
 - **Seed context:** `{{ .SeedName }}` = the seed's own name (from `SEED_NAME` env var)
+
+### Control-Plane Target
+
+Addons with `target: controlplane` deploy a per-shoot controller into the shoot's
+control-plane namespace **on the seed** (via a seed-class ManagedResource named
+`seed-<name>`), plus a shoot-class ManagedResource (`<name>`) that carries the
+in-shoot resources (typically a ServiceAccount and read-only RBAC). This suits
+controllers that must run outside the shoot but act on it via the token-requestor
+pattern.
+
+The chart is rendered **twice** with an injected `renderTarget` value
+(`controlplane` or `shoot`); templates branch on it to emit each half:
+
+```yaml
+{{- if ne .Values.renderTarget "shoot" }}
+# controller Deployment, config, credentials, token-requestor Secret
+{{- end }}
+{{- if ne .Values.renderTarget "controlplane" }}
+# in-shoot ServiceAccount + RBAC
+{{- end }}
+```
+
+Notes:
+
+- Unlike `target: seed`, control-plane addons are per-shoot and are **not**
+  skipped on managed seeds.
+- The in-shoot ServiceAccount should live in an **existing** namespace: a
+  shoot-class ManagedResource that creates a new namespace and resources inside
+  it in the same MR can fail on the shoot GRM's namespace cache and not recover.
+- During shoot hibernation the controller workload is annotated to skip health
+  checks (same as other addon workloads).
+
+## Secret Values
+
+`secretValues` injects data from Secrets on the seed into the chart values at
+render time, so sensitive values never appear in the addon manifest ConfigMap --
+the manifest carries only the Secret reference:
+
+```yaml
+secretValues:
+  - valuesKey: credentials          # chart values key to merge under
+    seedSecretRef:
+      name: my-addon-credentials    # Secret on the seed the extension runs on
+      namespace: garden             # defaults to the extension namespace
+```
+
+The Secret's string data is merged under `valuesKey`; non-secret values already
+set there (e.g. a Secret name from `shootValues`) are preserved. A missing
+Secret is a hard error (fail closed). The referenced Secret must exist on
+**every seed** where the addon renders.
 
 ## Managed Seed Behavior
 

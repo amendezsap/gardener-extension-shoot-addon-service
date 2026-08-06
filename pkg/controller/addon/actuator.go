@@ -498,6 +498,20 @@ metadata:
 		}
 		newStatus.Addons[addon.Name] = addonStatus
 
+		// Skip deployment for hibernated shoots: the controller has nothing to
+		// act on (no shoot apiserver or nodes), and a shoot-class MR created
+		// DURING hibernation can never be applied (the shoot's GRM is scaled
+		// down), leaving it permanently unhealthy. MRs that already existed
+		// before hibernation are left untouched — their statuses froze healthy
+		// and the controller workload carries the skip-health-check annotation.
+		// The addon stays registered in newStatus so the removed-addon cleanup
+		// does not try to delete MRs while the shoot is unreachable; deployment
+		// resumes automatically on the wake-up reconcile.
+		if hibernated {
+			log.Info("Shoot is hibernated, skipping control-plane addon deployment", "addon", addon.Name)
+			continue
+		}
+
 		var addonOverride *config.AddonOverride
 		if cfg.Addons != nil {
 			if override, ok := cfg.Addons[addon.Name]; ok {
@@ -590,20 +604,34 @@ metadata:
 
 			// Delete the shoot MR. Fall back to addon name if ManagedResourceName
 			// wasn't tracked (deployed by older extension version).
+			//
+			// The deletion wait is BOUNDED (10s): an unbounded wait serializes
+			// mass disable transitions (each shoot reconcile blocks minutes on
+			// GRM garbage collection) and hangs forever for shoots whose MRs
+			// cannot finalize (e.g. hibernated shoots). On timeout the addon is
+			// kept in newStatus so cleanup retries on the next reconcile instead
+			// of blocking this one.
 			mrName := addonStatus.ManagedResourceName
 			if mrName == "" {
 				mrName = addonName
 			}
-			if err := a.deleteManagedResource(ctx, ex.Namespace, mrName); err != nil {
-				log.Info("Failed to delete MR for removed addon", "addon", addonName, "managedResource", mrName, "error", err)
-			} else {
-				log.Info("Deleted MR for removed addon", "addon", addonName, "managedResource", mrName)
+			delCtx, cancelDel := context.WithTimeout(ctx, 10*time.Second)
+			err := a.deleteManagedResource(delCtx, ex.Namespace, mrName)
+			cancelDel()
+			if err != nil {
+				log.Info("MR deletion for removed addon not complete yet, retrying next reconcile",
+					"addon", addonName, "managedResource", mrName, "error", err)
+				newStatus.Addons[addonName] = addonStatus
+				continue
 			}
+			log.Info("Deleted MR for removed addon", "addon", addonName, "managedResource", mrName)
 
-			// Also try common legacy names
+			// Also try common legacy names (best effort, bounded)
 			for _, legacyName := range []string{"addon-" + addonName, "seed-addon-" + addonName, "seed-" + addonName} {
 				if legacyName != mrName {
-					_ = a.deleteManagedResource(ctx, ex.Namespace, legacyName)
+					legacyCtx, cancelLegacy := context.WithTimeout(ctx, 10*time.Second)
+					_ = a.deleteManagedResource(legacyCtx, ex.Namespace, legacyName)
+					cancelLegacy()
 				}
 			}
 

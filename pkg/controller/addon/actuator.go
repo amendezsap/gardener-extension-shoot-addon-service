@@ -454,7 +454,25 @@ metadata:
 		// failed before its hash was recorded) are re-run instead of being
 		// silently marked done.
 		if len(shootHookJobs) > 0 {
-			a.applyShootHookJobs(ctx, log, ex.Namespace, addon.Name, shootHookJobs, addonStatus)
+			if hibernated {
+				// On a hibernated shoot the worker nodes are gone and the shoot
+				// API server is down, so a shoot-side hook Job can never run to
+				// completion. Creating its temp MR would leave an un-finalizable
+				// ManagedResource that lingers (and, at deletion time, blocks
+				// shoot teardown — see deleteShootHookMRs). Skip creating it; the
+				// hook re-runs automatically on wake (the next reconcile with
+				// hibernated=false). Preserve any previously recorded hook
+				// completion so the status stays consistent across the hibernation
+				// cycle and the removed-addon detection below doesn't misfire.
+				log.Info("Shoot is hibernated, skipping shoot hook Jobs", "addon", addon.Name)
+				if prevStatus != nil {
+					if prev, ok := prevStatus.Addons[addon.Name]; ok {
+						addonStatus.HookJobsCompleted = prev.HookJobsCompleted
+					}
+				}
+			} else {
+				a.applyShootHookJobs(ctx, log, ex.Namespace, addon.Name, shootHookJobs, addonStatus)
+			}
 		}
 
 		log.Info("Deploying addon ManagedResource", "addon", addon.Name, "managedResource", mrName, "targetNamespace", ns)
@@ -626,6 +644,9 @@ metadata:
 			}
 			log.Info("Deleted MR for removed addon", "addon", addonName, "managedResource", mrName)
 
+			// Remove any leftover temporary shoot-side hook-Job MRs for this addon.
+			a.deleteShootHookMRs(ctx, log, ex.Namespace, addonName)
+
 			// Also try common legacy names (best effort, bounded)
 			for _, legacyName := range []string{"addon-" + addonName, "seed-addon-" + addonName, "seed-" + addonName} {
 				if legacyName != mrName {
@@ -741,6 +762,10 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 			log.Error(err, "Failed to delete ManagedResource", "addon", addon.Name)
 			errs = append(errs, err)
 		}
+		// Remove any leftover temporary shoot-side hook-Job MRs
+		// (addon-hook-<addon>-<i>). On a hibernated shoot these are never
+		// cleaned up by applyShootHookJobs and, if left, block shoot deletion.
+		a.deleteShootHookMRs(ctx, log, ex.Namespace, addon.Name)
 		// Control-plane addons also have a seed-class MR (the controller in the
 		// control-plane namespace on the seed). The loop above removed the shoot
 		// RBAC MR; remove the seed-class MR here.
@@ -2789,6 +2814,39 @@ func (a *actuator) applyHookSecrets(ctx context.Context, log logr.Logger, restCo
 			} else {
 				log.Info("Created hook Secret", "addon", addonName, "name", obj.GetName())
 			}
+		}
+	}
+}
+
+// deleteShootHookMRs removes any temporary shoot-side hook-Job ManagedResources
+// (named "addon-hook-<addonName>-<i>") left behind for the given addon.
+//
+// applyShootHookJobs creates these temp MRs to run a shoot-side hook Job and
+// normally deletes each one once GRM reports the Job terminal. On a hibernated
+// shoot the Job can never run to completion (no worker nodes / API server down),
+// so its temp MR is never cleaned up. And because the extension's Delete path
+// only ever deleted the addon's main MR (GetManagedResourceName), a temp hook MR
+// that was still present at deletion time was never issued for deletion at all —
+// it lingered in the control-plane namespace and blocked shoot deletion (the MR
+// gardener waits on: "shoot managed resource .../addon-hook-<addon>-0 still
+// exists"). This deletes all such temp MRs (best-effort, bounded to a List +
+// per-match delete); GRM finalizes them once the shoot API server is reachable
+// (gardener scales the control plane up during shoot deletion).
+func (a *actuator) deleteShootHookMRs(ctx context.Context, log logr.Logger, namespace, addonName string) {
+	mrList := &resourcesv1alpha1.ManagedResourceList{}
+	if err := a.client.List(ctx, mrList, client.InNamespace(namespace)); err != nil {
+		log.Info("Failed to list ManagedResources for hook MR cleanup", "addon", addonName, "error", err)
+		return
+	}
+	prefix := fmt.Sprintf("addon-hook-%s-", addonName)
+	for i := range mrList.Items {
+		name := mrList.Items[i].Name
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		log.Info("Deleting leftover shoot hook temp MR", "addon", addonName, "managedResource", name)
+		if err := managedresources.DeleteForShoot(ctx, a.client, namespace, name); err != nil {
+			log.Info("Failed to delete leftover shoot hook temp MR", "managedResource", name, "error", err)
 		}
 	}
 }

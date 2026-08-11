@@ -40,6 +40,12 @@ The extension **cannot access shoot clusters directly**. All resources are appli
    - First deploy: temp MR created (non-blocking), GRM applies Job to shoot, next reconcile checks MR status, records hash, deletes temp MR
    - Steady state: hash matches → skip entirely (<1ms, no MR, no GRM interaction)
    - Chart upgrade: hash differs → new temp MR created
+   - **Hibernated shoot**: temp hook MRs are **not** created. The shoot has no
+     worker nodes and its API server is down, so the Job could never run to
+     completion and its temp MR would linger un-finalizable (and block shoot
+     deletion). Hook execution resumes automatically on the wake-up reconcile.
+     Any temp hook MR left over from before hibernation (or from an older
+     extension version) is deleted on Extension deletion and on addon removal.
 3. **Non-Job hook resources** (SAs, Roles, RoleBindings) go into the persistent MR (idempotent)
 
 ### Delete Hooks

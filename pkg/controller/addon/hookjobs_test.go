@@ -118,3 +118,54 @@ func TestApplyShootHookJobs_SkipsWhenHashMatches(t *testing.T) {
 		t.Fatalf("expected no temp MR when hash matches, got err=%v", err)
 	}
 }
+
+// mrObj is a small helper to build a ManagedResource for the fake client.
+func mrObj(name string) *resourcesv1alpha1.ManagedResource {
+	return &resourcesv1alpha1.ManagedResource{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: hookTestNamespace},
+	}
+}
+
+// deleteShootHookMRs must delete every temp hook MR for the addon
+// (addon-hook-<addon>-<i>) and leave unrelated MRs — including the addon's own
+// main MR and other addons' hook MRs — untouched. This is the cleanup that
+// unblocks shoot deletion when a hibernated shoot left an un-finalizable hook MR.
+func TestDeleteShootHookMRs_DeletesOnlyMatchingHookMRs(t *testing.T) {
+	ctx := context.Background()
+	a := newHookTestActuator(
+		mrObj("addon-hook-sample-0"), // match
+		mrObj("addon-hook-sample-1"), // match (multi-hook addon)
+		mrObj("addon-sample"),        // addon's main MR — must survive
+		mrObj("addon-hook-other-0"),  // different addon — must survive
+		mrObj("fluent-bit"),          // unrelated — must survive
+	)
+
+	a.deleteShootHookMRs(ctx, logr.Discard(), hookTestNamespace, hookTestAddon)
+
+	deleted := []string{"addon-hook-sample-0", "addon-hook-sample-1"}
+	for _, name := range deleted {
+		err := a.client.Get(ctx, types.NamespacedName{Name: name, Namespace: hookTestNamespace}, &resourcesv1alpha1.ManagedResource{})
+		if !apierrors.IsNotFound(err) {
+			t.Fatalf("expected hook MR %q deleted, got err=%v", name, err)
+		}
+	}
+
+	survivors := []string{"addon-sample", "addon-hook-other-0", "fluent-bit"}
+	for _, name := range survivors {
+		if err := a.client.Get(ctx, types.NamespacedName{Name: name, Namespace: hookTestNamespace}, &resourcesv1alpha1.ManagedResource{}); err != nil {
+			t.Fatalf("expected MR %q to survive hook cleanup, got err=%v", name, err)
+		}
+	}
+}
+
+// With no matching hook MRs present, cleanup is a no-op and does not error.
+func TestDeleteShootHookMRs_NoMatchIsNoop(t *testing.T) {
+	ctx := context.Background()
+	a := newHookTestActuator(mrObj("addon-sample"))
+
+	a.deleteShootHookMRs(ctx, logr.Discard(), hookTestNamespace, hookTestAddon)
+
+	if err := a.client.Get(ctx, types.NamespacedName{Name: "addon-sample", Namespace: hookTestNamespace}, &resourcesv1alpha1.ManagedResource{}); err != nil {
+		t.Fatalf("unrelated MR must survive, got err=%v", err)
+	}
+}

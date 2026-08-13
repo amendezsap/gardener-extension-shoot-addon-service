@@ -949,13 +949,16 @@ func (a *actuator) ForceDelete(ctx context.Context, log logr.Logger, ex *extensi
 	log = log.WithValues("shoot", meta.Name, "operation", "force-delete")
 	var errs []error
 
-	// Delete MRs (skip hooks — force-delete must be fast)
+	// Delete MRs (skip running hooks — force-delete must be fast — but still
+	// remove any leftover temporary hook-Job MRs so an un-finalizable
+	// addon-hook-<addon>-<i> doesn't linger and stall namespace teardown).
 	for i := range manifest.Addons {
 		addon := &manifest.Addons[i]
 		mrName := addon.GetManagedResourceName()
 		if err := a.deleteManagedResource(ctx, ex.Namespace, mrName); err != nil {
 			errs = append(errs, err)
 		}
+		a.deleteShootHookMRs(ctx, log, ex.Namespace, addon.Name)
 	}
 	_ = a.deleteManagedResource(ctx, ex.Namespace, mrNamespace)
 	if len(manifest.RegistrySecrets) > 0 {
@@ -1041,6 +1044,13 @@ func (a *actuator) Migrate(ctx context.Context, log logr.Logger, ex *extensionsv
 			log.Error(err, "Failed to delete ManagedResource during migrate", "addon", addon.Name)
 			errs = append(errs, err)
 		}
+		// Remove any leftover temporary shoot-side hook-Job MRs
+		// (addon-hook-<addon>-<i>). Control-plane migration blocks on gardener's
+		// "wait until shoot managed resources have been deleted" step, so a
+		// lingering hook MR stalls the whole migration. Migrate is the terminal
+		// source-seed flow — no Reconcile runs after it to recreate the MR — so
+		// deleting it here clears the block for good.
+		a.deleteShootHookMRs(ctx, log, ex.Namespace, addon.Name)
 	}
 
 	// Delete namespace and registry secret MRs

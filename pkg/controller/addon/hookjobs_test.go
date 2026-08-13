@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"testing"
 
+	extensionsv1alpha1 "github.com/gardener/gardener/pkg/apis/extensions/v1alpha1"
 	gardencorev1beta1 "github.com/gardener/gardener/pkg/apis/core/v1beta1"
 	resourcesv1alpha1 "github.com/gardener/gardener/pkg/apis/resources/v1alpha1"
 	"github.com/go-logr/logr"
@@ -167,5 +168,41 @@ func TestDeleteShootHookMRs_NoMatchIsNoop(t *testing.T) {
 
 	if err := a.client.Get(ctx, types.NamespacedName{Name: "addon-sample", Namespace: hookTestNamespace}, &resourcesv1alpha1.ManagedResource{}); err != nil {
 		t.Fatalf("unrelated MR must survive, got err=%v", err)
+	}
+}
+
+// Migrate must delete leftover temporary hook-Job MRs. Control-plane migration
+// blocks on "wait until shoot managed resources have been deleted", so a
+// lingering addon-hook-<addon>-<i> stalls the whole migration. This is the
+// regression guard for that gap (Migrate previously deleted only the addon's
+// main MR, not its temp hook MRs).
+func TestMigrate_DeletesLeftoverHookMRs(t *testing.T) {
+	ctx := context.Background()
+	manifest := `
+apiVersion: addons.gardener.cloud/v1alpha1
+kind: AddonManifest
+defaultNamespace: managed-resources
+addons:
+  - name: sample
+    chart:
+      oci: oci://registry.example.com/charts/sample
+      version: "1.0.0"
+    enabled: true
+    target: shoot
+`
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: ConfigMapName, Namespace: hookTestNamespace},
+		Data:       map[string]string{"manifest.yaml": manifest},
+	}
+	a := newHookTestActuator(cm, mrObj("addon-hook-sample-0"), mrObj("sample"))
+	ex := &extensionsv1alpha1.Extension{ObjectMeta: metav1.ObjectMeta{Name: "shoot-addon-service", Namespace: hookTestNamespace}}
+
+	if err := a.Migrate(ctx, logr.Discard(), ex); err != nil {
+		t.Fatalf("Migrate returned error: %v", err)
+	}
+
+	err := a.client.Get(ctx, types.NamespacedName{Name: "addon-hook-sample-0", Namespace: hookTestNamespace}, &resourcesv1alpha1.ManagedResource{})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("expected temp hook MR deleted by Migrate, got err=%v", err)
 	}
 }

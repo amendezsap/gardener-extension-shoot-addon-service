@@ -52,7 +52,11 @@ func run(ctx context.Context, log logr.Logger) error {
 		return fmt.Errorf("add schemes: %w", err)
 	}
 
-	// Addon controller (reads manifest, deploys charts as ManagedResources)
+	// Addon controller (reads manifest, deploys charts as ManagedResources).
+	// Reconcile shoots in parallel (default is 1 -> a full-fleet reconcile drains
+	// serially, ~1-3 shoots/min). 10 lets the addon step keep pace with gardenlet;
+	// higher would pressure the individual shoot apiservers.
+	addonctrl.DefaultAddOptions.Controller.MaxConcurrentReconciles = 10
 	if err := addonctrl.AddToManager(ctx, mgr); err != nil {
 		return fmt.Errorf("add addon controller: %w", err)
 	}

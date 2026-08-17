@@ -1582,7 +1582,7 @@ metadata:
     gardener.cloud/role: extension
 `, targetNS)),
 	}
-	// keepObjects=true: the target namespace is SHARED seed infrastructure — the
+	// keepObjects=true: the target namespace is SHARED seed infrastructure -- the
 	// same namespace object is managed by every shoot's seed-class MR on this
 	// seed. It must survive the teardown of any single shoot's MR. With
 	// keepObjects=false, deleting one shoot's control-plane namespace makes its
@@ -1618,18 +1618,18 @@ metadata:
 	for _, r := range rendered {
 		log.Info("Deploying seed addon ManagedResource", "addon", r.addon.Name, "managedResource", r.mrName)
 		// keepObjects=true: seed-targeted (and global) addons deploy a SINGLE
-		// shared controller per seed (e.g. the vali-pvc-fixer / mrc-suppressor
-		// ServiceAccount + Deployment) into the shared DefaultNamespace
-		// ("managed-resources"). That controller is redundantly declared by every
-		// shoot's seed-class MR on this seed. With keepObjects=false, deleting one
-		// shoot removes the shared controller's objects; sibling shoots then report
-		// ControlPlane Error ("Required ServiceAccount \"...\" in namespace
-		// \"managed-resources\" is missing") until their next reconcile recreates
-		// them — and the recreate races the same object another dying MR is
-		// deleting. keepObjects=true decouples the shared controller's lifecycle
-		// from any single shoot's teardown; it is reclaimed at seed teardown (or,
-		// once no shoot enables the addon, by an explicit seed-scoped cleanup —
-		// see the reference-count/single-owner follow-up).
+		// shared controller per seed (its ServiceAccount + Deployment) into the
+		// shared DefaultNamespace ("managed-resources"). That controller is
+		// redundantly declared by every shoot's seed-class MR on this seed. With
+		// keepObjects=false, deleting one shoot removes the shared controller's
+		// objects; sibling shoots then report ControlPlane Error ("Required
+		// ServiceAccount \"...\" in namespace \"managed-resources\" is missing")
+		// until their next reconcile recreates them, and the recreate races the
+		// same object another dying MR is deleting. keepObjects=true decouples the
+		// shared controller's lifecycle from any single shoot's teardown; it is
+		// reclaimed at seed teardown (or, once no shoot enables the addon, by an
+		// explicit seed-scoped cleanup -- see the reference-count/single-owner
+		// follow-up).
 		if err := managedresources.CreateForSeed(ctx, a.client, namespace, r.mrName, true, r.secretData); err != nil {
 			log.Error(err, "Failed to deploy seed addon ManagedResource", "addon", r.addon.Name)
 		}

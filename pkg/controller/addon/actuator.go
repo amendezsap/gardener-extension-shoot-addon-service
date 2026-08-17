@@ -1582,7 +1582,17 @@ metadata:
     gardener.cloud/role: extension
 `, targetNS)),
 	}
-	if err := managedresources.CreateForSeed(ctx, a.client, namespace, mrNamespaceSeed, false, nsData); err != nil {
+	// keepObjects=true: the target namespace is SHARED seed infrastructure — the
+	// same namespace object is managed by every shoot's seed-class MR on this
+	// seed. It must survive the teardown of any single shoot's MR. With
+	// keepObjects=false, deleting one shoot's control-plane namespace makes its
+	// seed GRM delete the shared namespace; sibling shoots' MRs immediately
+	// recreate it, the dying MR re-deletes it, and the namespace flaps
+	// Terminating->recreated forever. That deadlocks the shoot deletion (the MR
+	// never finalizes) and makes sibling applies fail with "unable to create new
+	// content in namespace ... because it is being terminated". keepObjects=true
+	// leaves the shared namespace in place; it is reclaimed at seed teardown.
+	if err := managedresources.CreateForSeed(ctx, a.client, namespace, mrNamespaceSeed, true, nsData); err != nil {
 		return fmt.Errorf("deploy seed addon namespace: %w", err)
 	}
 
@@ -1593,7 +1603,11 @@ metadata:
 		if err != nil {
 			log.Error(err, "Failed to render seed registry secrets")
 		} else {
-			if err := managedresources.CreateForSeed(ctx, a.client, namespace, mrRegistrySecretsSeed, false, secretData); err != nil {
+			// keepObjects=true for the same reason as the namespace above: the
+			// pull secret is a shared, fixed-name object in the shared namespace,
+			// managed by every shoot's seed-class MR. Deleting one shoot must not
+			// remove the pull secret that sibling shoots depend on.
+			if err := managedresources.CreateForSeed(ctx, a.client, namespace, mrRegistrySecretsSeed, true, secretData); err != nil {
 				log.Error(err, "Failed to deploy seed registry secrets")
 			}
 		}
@@ -1603,7 +1617,20 @@ metadata:
 	currentSeedMRNames := make(map[string]bool, len(rendered))
 	for _, r := range rendered {
 		log.Info("Deploying seed addon ManagedResource", "addon", r.addon.Name, "managedResource", r.mrName)
-		if err := managedresources.CreateForSeed(ctx, a.client, namespace, r.mrName, false, r.secretData); err != nil {
+		// keepObjects=true: seed-targeted (and global) addons deploy a SINGLE
+		// shared controller per seed (e.g. the vali-pvc-fixer / mrc-suppressor
+		// ServiceAccount + Deployment) into the shared DefaultNamespace
+		// ("managed-resources"). That controller is redundantly declared by every
+		// shoot's seed-class MR on this seed. With keepObjects=false, deleting one
+		// shoot removes the shared controller's objects; sibling shoots then report
+		// ControlPlane Error ("Required ServiceAccount \"...\" in namespace
+		// \"managed-resources\" is missing") until their next reconcile recreates
+		// them — and the recreate races the same object another dying MR is
+		// deleting. keepObjects=true decouples the shared controller's lifecycle
+		// from any single shoot's teardown; it is reclaimed at seed teardown (or,
+		// once no shoot enables the addon, by an explicit seed-scoped cleanup —
+		// see the reference-count/single-owner follow-up).
+		if err := managedresources.CreateForSeed(ctx, a.client, namespace, r.mrName, true, r.secretData); err != nil {
 			log.Error(err, "Failed to deploy seed addon ManagedResource", "addon", r.addon.Name)
 		}
 		currentSeedMRNames[r.mrName] = true

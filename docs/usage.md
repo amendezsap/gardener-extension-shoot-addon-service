@@ -280,6 +280,18 @@ env ADDON_FLUENT_BIT_IMAGE_REPOSITORY -> image override
 
 The `shootValues` field supports full [Go template](https://pkg.go.dev/text/template) syntax with [Sprig](https://masterminds.github.io/sprig/) string functions. This includes conditionals, pipelines, and string manipulation.
 
+> **Template variables are expanded only in `shootValues`.** They are **not** expanded in
+> the chart's `values.yaml`, the `values.<addon>.yaml` / `values.<addon>.<provider>.yaml`
+> value files, or anywhere else — those are passed to the chart verbatim. Putting a
+> variable like `{{ .ShootName }}` in a values file sends the literal string
+> `{{ .ShootName }}` to the chart, which usually surfaces as a confusing runtime error in
+> the workload (e.g. a program rejecting a "template placeholder" value). Any value that
+> must vary per shoot (cluster id/name, region, seed) belongs in `shootValues`.
+>
+> The extension **enforces** this: if a Gardener template variable survives into the final
+> chart values, the reconcile fails with a clear error naming the offending value key,
+> rather than shipping the literal `{{ ... }}` string to the chart.
+
 Available variables:
 
 | Variable | Description | Example Value |
@@ -327,7 +339,7 @@ Additional managed Kubernetes services (OKE, DOKS, LKE, etc.) can be added on re
 
 The following are noted as possible future enhancements but **not currently supported**:
 
-- **OpenStack-based managed Kubernetes services** — services like OTC CCE, SAP Converged Cloud, or Yandex Managed Kubernetes that run on OpenStack infrastructure. Note that OpenStack itself is an IaaS, not a managed Kubernetes service — clusters provisioned by Gardener on OpenStack VMs correctly report `ProviderType=openstack` and `ManagedKubernetesProvider=""`. Detection would only apply to clusters where the cloud provider also runs the Kubernetes control plane.
+- **OpenStack-based managed Kubernetes services** — services that run a managed Kubernetes control plane on OpenStack infrastructure. Note that OpenStack itself is an IaaS, not a managed Kubernetes service — clusters provisioned by Gardener on OpenStack VMs correctly report `ProviderType=openstack` and `ManagedKubernetesProvider=""`. Detection would only apply to clusters where the cloud provider also runs the Kubernetes control plane.
 
 ### Example: Provider-aware addon configuration
 
@@ -501,6 +513,16 @@ image:
   defaultTag: "3.2.6"
 ```
 
+`defaultRepository` sets a **single full image path** at `valuesKey`. This works for charts
+that treat their image value as one full reference. Some third-party charts instead build
+the image from a **separate registry + repository** (e.g. `image.registry` defaulting to a
+public registry, joined with `image.repository`). For those, putting a full path in
+`repository` yields a broken reference like `<default-registry>/<your-full-path>`. When
+mirroring such a chart's image to your own registry, prefer the chart's own full-image
+value (many expose `fullImageName`, `image.fullName`, or `global.imageRegistry` +
+short `image.repository`) via the addon's `values.yaml`, rather than the `defaultRepository`
+override.
+
 ## GRM Namespace Provisioning
 
 The extension includes an admission webhook that injects custom namespaces into the GRM's `targetClientConnection.namespaces` list. This ensures the GRM watches namespaces where addon ManagedResources deploy their resources (e.g., `managed-resources`).
@@ -514,3 +536,19 @@ grmNamespaces:
 ```
 
 The webhook fires on GRM ConfigMap CREATE events and adds any missing namespaces to the existing list. If the namespaces field is absent, GRM already watches all namespaces and no injection is needed.
+
+> **If an addon sets a custom `namespace`, that namespace must be in `grmNamespaces`.**
+> When GRM's client cache is scoped to a namespace list, it can only apply resources in
+> those namespaces; applying into any other namespace fails with
+> `unknown namespace for the cache` (visible as `SystemComponentsHealthy=False` on the
+> shoot, while the shoot's own reconcile still reports `Succeeded` — so it is easy to miss).
+> Either deploy the addon into a namespace already in `grmNamespaces` (commonly
+> `managed-resources`), or add the addon's namespace to `grmNamespaces`.
+>
+> This provisioning webhook exists as a workaround: a scoped GRM cache does not
+> automatically watch the namespaces its ManagedResources create. This is an upstream
+> Gardener limitation ([gardener/gardener#14427](https://github.com/gardener/gardener/issues/14427))
+> rather than a property of this extension.
+> For the same reason, a shoot-class ManagedResource that *creates* a namespace and places
+> resources inside it in the same MR can fail on the shoot GRM's namespace cache and not
+> recover — deploy into an existing, watched namespace instead.

@@ -2690,6 +2690,13 @@ func (a *actuator) renderAddonChartWithContext(ctx context.Context, log logr.Log
 		merged = mergeMaps(merged, extraValues)
 	}
 
+	// Guard: a Gardener template variable surviving into the final chart values means it
+	// was placed in a values file (only shootValues templates are expanded). Fail early
+	// with a clear error instead of shipping a literal "{{ .ShootName }}" to the chart.
+	if err := checkUnresolvedTemplates(merged); err != nil {
+		return nil, nil, fmt.Errorf("addon %q: %w", addon.Name, err)
+	}
+
 	ns := nsOverride
 	if ns == "" {
 		ns = addon.GetNamespace(manifest.DefaultNamespace)
@@ -3657,6 +3664,52 @@ func newTemplateData(meta *shootMetadata) *templateData {
 //
 // If a string does not contain template syntax ({{ }}), it is returned unchanged
 // (fast path, no template parsing overhead).
+// unresolvedGardenerTemplate matches a Go-template block that still references a
+// Gardener context variable (Region, ShootName, Project, ...). Only these extension
+// variables are matched, so a chart's own template values (e.g. "{{ .Values.foo }}")
+// are never flagged.
+var unresolvedGardenerTemplate = regexp.MustCompile(
+	`\{\{[^}]*\.(Region|SeedName|ShootName|ShootNamespace|Project|ControlNamespace|ProviderType|ClusterRole|ManagedKubernetesProvider)\b[^}]*\}\}`)
+
+// checkUnresolvedTemplates fails the reconcile if any string in the final merged chart
+// values still contains an unresolved Gardener template variable. Template variables are
+// expanded only in shootValues (see expandShootValues); a variable placed in a values
+// file is passed to the chart verbatim and typically surfaces as a confusing runtime
+// crash in the workload. This turns that silent, late footgun into a clear, early error.
+func checkUnresolvedTemplates(vals map[string]interface{}) error {
+	var offenders []string
+	var walk func(path string, v interface{})
+	walk = func(path string, v interface{}) {
+		switch val := v.(type) {
+		case string:
+			if unresolvedGardenerTemplate.MatchString(val) {
+				offenders = append(offenders, fmt.Sprintf("%s = %q", path, val))
+			}
+		case map[string]interface{}:
+			for k, mv := range val {
+				child := k
+				if path != "" {
+					child = path + "." + k
+				}
+				walk(child, mv)
+			}
+		case []interface{}:
+			for i, item := range val {
+				walk(fmt.Sprintf("%s[%d]", path, i), item)
+			}
+		}
+	}
+	walk("", vals)
+	if len(offenders) == 0 {
+		return nil
+	}
+	sort.Strings(offenders)
+	return fmt.Errorf(
+		"unresolved Gardener template(s) in chart values: %s -- template variables are "+
+			"expanded only in shootValues, not in values files; move these to the addon's shootValues",
+		strings.Join(offenders, "; "))
+}
+
 func expandShootValues(vals map[string]interface{}, meta *shootMetadata) map[string]interface{} {
 	data := newTemplateData(meta)
 	result := make(map[string]interface{}, len(vals))

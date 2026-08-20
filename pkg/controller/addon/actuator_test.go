@@ -279,3 +279,49 @@ func TestExpandValueFastPath(t *testing.T) {
 	// Verify the fast path doesn't apply to strings with {{
 	_ = strings.Contains("{{ .Region }}", "{{") // just for clarity
 }
+
+func TestCheckUnresolvedTemplates(t *testing.T) {
+	tests := []struct {
+		name      string
+		vals      map[string]interface{}
+		wantErr   bool
+		wantInMsg string
+	}{
+		{
+			name:    "clean values pass",
+			vals:    map[string]interface{}{"image": map[string]interface{}{"repo": "example.com/agent", "tag": "v1"}, "region": "us-east-1"},
+			wantErr: false,
+		},
+		{
+			name:      "gardener template in a values file value is flagged",
+			vals:      map[string]interface{}{"clusterId": "{{ .Project }}-{{ .ShootName }}"},
+			wantErr:   true,
+			wantInMsg: "clusterId",
+		},
+		{
+			name:    "chart's own template value is not a false positive",
+			vals:    map[string]interface{}{"tpl": "{{ .Values.foo }}", "helper": `{{ include "x" . }}`, "rel": "{{ .Release.Name }}"},
+			wantErr: false,
+		},
+		{
+			name:      "nested map and slice are walked",
+			vals:      map[string]interface{}{"agent": map[string]interface{}{"env": []interface{}{map[string]interface{}{"name": "R", "value": "{{ .Region }}"}}}},
+			wantErr:   true,
+			wantInMsg: "agent.env[0].value",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := checkUnresolvedTemplates(tt.vals)
+			if tt.wantErr && err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("expected no error, got %v", err)
+			}
+			if tt.wantInMsg != "" && (err == nil || !strings.Contains(err.Error(), tt.wantInMsg)) {
+				t.Fatalf("expected error to mention %q, got %v", tt.wantInMsg, err)
+			}
+		})
+	}
+}

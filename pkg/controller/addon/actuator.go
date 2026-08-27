@@ -316,13 +316,12 @@ metadata:
 		}
 	}
 
-	// Global AWS: continuously detach externally-attached policies (policies added to the
-	// node role out of band by account automation, which Gardener did not attach and would
-	// otherwise leave in place). Doing this every reconcile — not only at delete — means
-	// such a policy is typically already gone before deletion begins, so DeleteRole never
-	// hits a 409 DeleteConflict even if the Delete-path detach is somehow missed.
-	// Best-effort: never fail the reconcile on it. Matched by name (account-local,
-	// non-default IAM path).
+	// Global AWS: continuously detach the AGGRESSIVE detach list (IAMPoliciesDetach) on every
+	// reconcile while the shoot is alive. Use only for policies that must be kept off the
+	// node role continuously (it will fight anything that re-attaches them). The common
+	// unblock-DeleteRole case uses IAMPoliciesDetachOnDelete instead (handled only in the
+	// delete paths), so this block is empty/no-op unless IAMPoliciesDetach is explicitly set.
+	// Best-effort: never fail the reconcile on it. Matched by name (account-local path).
 	if meta.ProviderType == "aws" && manifest.GlobalAWS != nil && len(manifest.GlobalAWS.IAMPoliciesDetach) > 0 {
 		for _, policyName := range manifest.GlobalAWS.IAMPoliciesDetach {
 			detached, err := awsClient.DetachRolePolicyByName(ctx, meta.NodeRoleName, policyName)
@@ -881,11 +880,14 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 					}
 				}
 
-				// Detach externally-attached policies (policies added to the node role out
-				// of band by account automation) so DeleteRole does not 409. Matched by
-				// name because these are account-local at a non-default path.
-				if manifest.GlobalAWS != nil && len(manifest.GlobalAWS.IAMPoliciesDetach) > 0 {
-					for _, policyName := range manifest.GlobalAWS.IAMPoliciesDetach {
+				// Detach externally-attached policies (added to the node role out of band by
+				// account automation) so DeleteRole does not 409. At delete we detach the
+				// UNION of both lists: IAMPoliciesDetachOnDelete (the safe, delete-only list)
+				// and IAMPoliciesDetach (the aggressive list, also detached every reconcile).
+				// Matched by name because these are account-local at a non-default path.
+				if manifest.GlobalAWS != nil {
+					detachAtDelete := append(append([]string{}, manifest.GlobalAWS.IAMPoliciesDetachOnDelete...), manifest.GlobalAWS.IAMPoliciesDetach...)
+					for _, policyName := range detachAtDelete {
 						detached, err := awsClient.DetachRolePolicyByName(ctx, meta.NodeRoleName, policyName)
 						if err != nil {
 							log.Error(err, "Failed to detach external IAM policy", "policy", policyName, "nodeRole", meta.NodeRoleName)
@@ -1023,8 +1025,9 @@ func (a *actuator) ForceDelete(ctx context.Context, log logr.Logger, ex *extensi
 						policyARN := fmt.Sprintf("arn:%s:iam::aws:policy/%s", meta.Partition, policyName)
 						_ = awsClient.DetachRolePolicy(ctx, meta.NodeRoleName, policyARN)
 					}
-					// Also drop externally-attached policies (by name) so the node role can be deleted.
-					for _, policyName := range manifest.GlobalAWS.IAMPoliciesDetach {
+					// Also drop externally-attached policies (union of both lists) by name so
+					// the node role can be deleted.
+					for _, policyName := range append(append([]string{}, manifest.GlobalAWS.IAMPoliciesDetachOnDelete...), manifest.GlobalAWS.IAMPoliciesDetach...) {
 						_, _ = awsClient.DetachRolePolicyByName(ctx, meta.NodeRoleName, policyName)
 					}
 				}

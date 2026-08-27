@@ -39,19 +39,28 @@ type GlobalAWSConfig struct {
 	// AmazonSSMManagedInstanceCore.
 	IAMPolicies []string `json:"iamPolicies,omitempty" yaml:"iamPolicies,omitempty"`
 
-	// IAMPoliciesDetach are policy NAMES the extension detaches from the shoot's node
-	// role before infrastructure deletion (and never attaches). Use this for policies
-	// attached OUT OF BAND by external automation in the account: Gardener detaches only
-	// what it attached, so a foreign managed policy left on the node role makes DeleteRole
-	// fail with a 409 DeleteConflict and wedges shoot deletion. Listing such a policy here
-	// detaches it (every reconcile and at delete) so teardown succeeds.
+	// IAMPoliciesDetachOnDelete are policy NAMES the extension detaches from the shoot's
+	// node role ONLY during shoot deletion (both the graceful and force-delete paths), and
+	// never attaches. This is the safe, minimal-footprint option for policies attached OUT
+	// OF BAND by external account automation: Gardener detaches only what it attached, so a
+	// foreign managed policy left on the node role makes DeleteRole fail with a 409
+	// DeleteConflict and wedges shoot deletion. Listing such a policy here removes it at the
+	// moment of teardown (not before), so the policy stays in place on healthy nodes for its
+	// whole life and there is no tug-of-war with whatever re-attaches it.
 	//
 	// Matched by NAME rather than ARN (see aws.Client.DetachRolePolicyByName): these are
 	// typically account-local policies at a non-default IAM path
 	// (arn:<partition>:iam::<account>:policy/<path>/<name>), whose ARN cannot be
-	// reconstructed from the name alone the way AWS-managed policy ARNs can. The listed
-	// policies are only ever detached, never attached — set this only for policies that are
-	// functionally unnecessary on the node role. Empty by default; configured per landscape.
+	// reconstructed from the name alone the way AWS-managed policy ARNs can. Detach-only,
+	// never attached. Empty by default; configured per landscape. Prefer this over
+	// IAMPoliciesDetach unless you specifically want continuous removal from live nodes.
+	IAMPoliciesDetachOnDelete []string `json:"iamPoliciesDetachOnDelete,omitempty" yaml:"iamPoliciesDetachOnDelete,omitempty"`
+
+	// IAMPoliciesDetach are policy NAMES the extension detaches on EVERY reconcile (while the
+	// shoot is alive) AND at delete. Use this only when a policy must be continuously kept
+	// off the node role — it will fight anything that re-attaches it. For the common case of
+	// merely unblocking DeleteRole, prefer IAMPoliciesDetachOnDelete. Same name-matching
+	// semantics as above; detach-only, never attached; empty by default.
 	IAMPoliciesDetach []string `json:"iamPoliciesDetach,omitempty" yaml:"iamPoliciesDetach,omitempty"`
 
 	// VPCEndpoints are Interface VPC endpoints created in the shoot's VPC.

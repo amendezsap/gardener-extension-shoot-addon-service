@@ -54,9 +54,17 @@ func (c *Credentials) AuthMode() string {
 
 // Client wraps AWS SDK clients for IAM and EC2 operations.
 type Client struct {
-	iam    *iam.Client
+	iam    iamAPI
 	ec2    *ec2.Client
 	region string
+}
+
+// iamAPI is the subset of the IAM client this package uses. Declared as an interface so the
+// role-policy logic can be unit-tested with a fake. *iam.Client satisfies it.
+type iamAPI interface {
+	AttachRolePolicy(ctx context.Context, in *iam.AttachRolePolicyInput, optFns ...func(*iam.Options)) (*iam.AttachRolePolicyOutput, error)
+	DetachRolePolicy(ctx context.Context, in *iam.DetachRolePolicyInput, optFns ...func(*iam.Options)) (*iam.DetachRolePolicyOutput, error)
+	ListAttachedRolePolicies(ctx context.Context, in *iam.ListAttachedRolePoliciesInput, optFns ...func(*iam.Options)) (*iam.ListAttachedRolePoliciesOutput, error)
 }
 
 // VPCEndpointInfo holds details about a VPC endpoint returned by queries.
@@ -169,6 +177,42 @@ func (c *Client) DetachRolePolicy(ctx context.Context, roleName, policyARN strin
 		return fmt.Errorf("detach policy %s from %s: %w", policyARN, roleName, err)
 	}
 	return nil
+}
+
+// DetachRolePolicyByName detaches from roleName whichever attached policy has the given
+// bare policy NAME, resolving its real ARN via ListAttachedRolePolicies first. Use this for
+// policies whose ARN we cannot construct reliably — notably account-local policies at a
+// non-default path (e.g. arn:<partition>:iam::<account>:policy/global/<name>), as opposed to
+// AWS-managed policies (arn:<partition>:iam::aws:policy/<name>). Matching by name sidesteps
+// having to know the account ID or path. Idempotent: a no-op (returns false, nil) if the
+// role does not exist or no attached policy matches. Returns true iff it detached one.
+func (c *Client) DetachRolePolicyByName(ctx context.Context, roleName, policyName string) (bool, error) {
+	var marker *string
+	for {
+		out, err := c.iam.ListAttachedRolePolicies(ctx, &iam.ListAttachedRolePoliciesInput{
+			RoleName: aws.String(roleName),
+			Marker:   marker,
+		})
+		if err != nil {
+			if isNoSuchEntity(err) {
+				return false, nil // role already gone — nothing to do
+			}
+			return false, fmt.Errorf("list attached policies for %s: %w", roleName, err)
+		}
+		for _, p := range out.AttachedPolicies {
+			if aws.ToString(p.PolicyName) == policyName {
+				if derr := c.DetachRolePolicy(ctx, roleName, aws.ToString(p.PolicyArn)); derr != nil {
+					return false, derr
+				}
+				return true, nil
+			}
+		}
+		if out.IsTruncated {
+			marker = out.Marker
+			continue
+		}
+		return false, nil
+	}
 }
 
 // --------------------------------------------------------------------------

@@ -316,6 +316,26 @@ metadata:
 		}
 	}
 
+	// Global AWS: continuously detach externally-attached policies (policies added to the
+	// node role out of band by account automation, which Gardener did not attach and would
+	// otherwise leave in place). Doing this every reconcile — not only at delete — means
+	// such a policy is typically already gone before deletion begins, so DeleteRole never
+	// hits a 409 DeleteConflict even if the Delete-path detach is somehow missed.
+	// Best-effort: never fail the reconcile on it. Matched by name (account-local,
+	// non-default IAM path).
+	if meta.ProviderType == "aws" && manifest.GlobalAWS != nil && len(manifest.GlobalAWS.IAMPoliciesDetach) > 0 {
+		for _, policyName := range manifest.GlobalAWS.IAMPoliciesDetach {
+			detached, err := awsClient.DetachRolePolicyByName(ctx, meta.NodeRoleName, policyName)
+			if err != nil {
+				log.Error(err, "Failed to detach external IAM policy (reconcile)", "policy", policyName, "nodeRole", meta.NodeRoleName)
+				continue
+			}
+			if detached {
+				log.Info("Detached externally-attached IAM policy from node role (reconcile)", "policy", policyName, "nodeRole", meta.NodeRoleName)
+			}
+		}
+	}
+
 	// Global AWS: ensure VPC endpoints (VPC-level infrastructure, not addon-specific)
 	if meta.ProviderType == "aws" && manifest.GlobalAWS != nil && len(manifest.GlobalAWS.VPCEndpoints) > 0 {
 		if cfg.IsVPCEndpointEnabled() {
@@ -860,6 +880,23 @@ func (a *actuator) Delete(ctx context.Context, log logr.Logger, ex *extensionsv1
 						}
 					}
 				}
+
+				// Detach externally-attached policies (policies added to the node role out
+				// of band by account automation) so DeleteRole does not 409. Matched by
+				// name because these are account-local at a non-default path.
+				if manifest.GlobalAWS != nil && len(manifest.GlobalAWS.IAMPoliciesDetach) > 0 {
+					for _, policyName := range manifest.GlobalAWS.IAMPoliciesDetach {
+						detached, err := awsClient.DetachRolePolicyByName(ctx, meta.NodeRoleName, policyName)
+						if err != nil {
+							log.Error(err, "Failed to detach external IAM policy", "policy", policyName, "nodeRole", meta.NodeRoleName)
+							errs = append(errs, err)
+							continue
+						}
+						if detached {
+							log.Info("Detached externally-attached IAM policy from node role", "policy", policyName, "nodeRole", meta.NodeRoleName, "reason", "unblock DeleteRole on shoot teardown")
+						}
+					}
+				}
 			}
 		}
 	}
@@ -985,6 +1022,10 @@ func (a *actuator) ForceDelete(ctx context.Context, log logr.Logger, ex *extensi
 					for _, policyName := range manifest.GlobalAWS.IAMPolicies {
 						policyARN := fmt.Sprintf("arn:%s:iam::aws:policy/%s", meta.Partition, policyName)
 						_ = awsClient.DetachRolePolicy(ctx, meta.NodeRoleName, policyARN)
+					}
+					// Also drop externally-attached policies (by name) so the node role can be deleted.
+					for _, policyName := range manifest.GlobalAWS.IAMPoliciesDetach {
+						_, _ = awsClient.DetachRolePolicyByName(ctx, meta.NodeRoleName, policyName)
 					}
 				}
 			}

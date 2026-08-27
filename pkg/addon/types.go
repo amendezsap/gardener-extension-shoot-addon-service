@@ -39,6 +39,21 @@ type GlobalAWSConfig struct {
 	// AmazonSSMManagedInstanceCore.
 	IAMPolicies []string `json:"iamPolicies,omitempty" yaml:"iamPolicies,omitempty"`
 
+	// IAMPoliciesDetach are policy NAMES the extension detaches from the shoot's node
+	// role before infrastructure deletion (and never attaches). Use this for policies
+	// attached OUT OF BAND by external automation in the account: Gardener detaches only
+	// what it attached, so a foreign managed policy left on the node role makes DeleteRole
+	// fail with a 409 DeleteConflict and wedges shoot deletion. Listing such a policy here
+	// detaches it (every reconcile and at delete) so teardown succeeds.
+	//
+	// Matched by NAME rather than ARN (see aws.Client.DetachRolePolicyByName): these are
+	// typically account-local policies at a non-default IAM path
+	// (arn:<partition>:iam::<account>:policy/<path>/<name>), whose ARN cannot be
+	// reconstructed from the name alone the way AWS-managed policy ARNs can. The listed
+	// policies are only ever detached, never attached — set this only for policies that are
+	// functionally unnecessary on the node role. Empty by default; configured per landscape.
+	IAMPoliciesDetach []string `json:"iamPoliciesDetach,omitempty" yaml:"iamPoliciesDetach,omitempty"`
+
 	// VPCEndpoints are Interface VPC endpoints created in the shoot's VPC.
 	// These are VPC-level infrastructure shared by all addons/workloads.
 	// The Gardener node security group is attached automatically.

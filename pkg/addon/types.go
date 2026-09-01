@@ -122,6 +122,15 @@ type Addon struct {
 	// including DaemonSets are safe to preserve.
 	KeepObjectsOnRename bool `json:"keepObjectsOnRename,omitempty" yaml:"keepObjectsOnRename,omitempty"`
 
+	// DeployOnManagedSeeds, when true, deploys this addon on MANAGED seeds too
+	// (normally target:seed addons are skipped on managed seeds — see
+	// reconcileSeedAddons). Only meaningful for a PURE target:seed addon that has no
+	// shoot-half: a global addon's shoot-half is already deployed into the managed-
+	// seed-as-shoot by the parent extension, so a seed-wide controller/sweeper that
+	// must run where the workload shoot control planes and their ManagedResources live
+	// would otherwise never deploy on the managed seed at all. Off by default; opt-in.
+	DeployOnManagedSeeds bool `json:"deployOnManagedSeeds,omitempty" yaml:"deployOnManagedSeeds,omitempty"`
+
 	// Hooks controls Helm hook rendering behavior. When nil, hooks are
 	// silently dropped (historical Gardener behavior). Set hooks.include: true
 	// to render hook-annotated templates.
@@ -211,6 +220,14 @@ func (a *Addon) DeploysToShoot() bool {
 func (a *Addon) DeploysToSeed() bool {
 	t := a.GetTarget()
 	return t == AddonTargetSeed || t == AddonTargetGlobal
+}
+
+// DeploysOnManagedSeeds returns true if this (pure target:seed) addon should also
+// deploy on managed seeds, where target:seed addons are otherwise skipped. Only
+// applies to seed addons; global addons are never force-deployed on managed seeds
+// (their shoot-half is already deployed there by the parent extension).
+func (a *Addon) DeploysOnManagedSeeds() bool {
+	return a.GetTarget() == AddonTargetSeed && a.DeployOnManagedSeeds
 }
 
 // DeploysToControlPlane returns true if the addon is a per-shoot control-plane

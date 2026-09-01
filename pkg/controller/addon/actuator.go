@@ -1458,30 +1458,47 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 	// addon ManagedResource targeting this seed. If an addon MR already exists
 	// from the parent extension, skip seed addons.
 	seedName := os.Getenv("SEED_NAME")
-	if a.isManagedSeed(ctx, log, seedName) {
-		log.Info("Skipping seed addon deployment — managed seed, parent extension deploys via shoot MR",
-			"seedName", seedName)
-		// Clean up any stale seed MRs (current + legacy names).
-		for _, name := range append(oldSeedNamespaceMRNames, mrNamespaceSeed, mrRegistrySecretsSeed) {
-			if err := managedresources.DeleteForSeed(ctx, a.client, namespace, name); err == nil {
-				log.Info("Cleaned up stale seed ManagedResource", "managedResource", name)
-			}
-		}
+	managedSeed := a.isManagedSeed(ctx, log, seedName)
+	if managedSeed {
+		// On managed seeds, target:seed addons are normally skipped: the parent
+		// extension already deploys shoot/global addons' shoot-half into the
+		// managed-seed-as-shoot via shoot-class MRs, so deploying the seed-half here
+		// too would duplicate. BUT a PURE target:seed addon has no shoot-half, so
+		// nothing else ever deploys it on the managed seed. Deploy ONLY addons that
+		// opt in with deployOnManagedSeeds:true (e.g. a seed-wide controller/sweeper
+		// that must run where the workload shoot control planes and their
+		// ManagedResources live). Clean up the seed MRs of everything NOT opted in so
+		// global addons are not duplicated.
+		anyOptIn := false
 		for i := range manifest.Addons {
 			addon := &manifest.Addons[i]
+			if addon.DeploysToSeed() && addon.Enabled && addon.DeploysOnManagedSeeds() {
+				anyOptIn = true
+				continue
+			}
 			if addon.DeploysToSeed() {
 				mrName := addon.GetSeedManagedResourceName()
 				if err := managedresources.DeleteForSeed(ctx, a.client, namespace, mrName); err == nil {
 					log.Info("Cleaned up stale seed ManagedResource", "managedResource", mrName)
 				}
 				for _, oldName := range oldSeedMRNames(addon.Name) {
-					if err := managedresources.DeleteForSeed(ctx, a.client, namespace, oldName); err == nil {
-						log.Info("Cleaned up stale seed ManagedResource", "managedResource", oldName)
-					}
+					_ = managedresources.DeleteForSeed(ctx, a.client, namespace, oldName)
 				}
 			}
 		}
-		return nil
+		if !anyOptIn {
+			log.Info("Skipping seed addon deployment — managed seed, no deployOnManagedSeeds addons",
+				"seedName", seedName)
+			// Clean up shared seed namespace/registry MRs too (nothing to deploy).
+			for _, name := range append(oldSeedNamespaceMRNames, mrNamespaceSeed, mrRegistrySecretsSeed) {
+				_ = managedresources.DeleteForSeed(ctx, a.client, namespace, name)
+			}
+			return nil
+		}
+		log.Info("Managed seed: deploying opt-in seed sweeper addon(s) (deployOnManagedSeeds)",
+			"seedName", seedName)
+		// Fall through: the render/deploy loops below restrict to opt-in addons on
+		// managed seeds via the managedSeed guard.
 	}
 
 	extensionNS := getExtensionNamespace()
@@ -1508,16 +1525,19 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 	// cluster types. Empty if self-managed Kubernetes.
 	managedK8s := a.getManagedKubernetesProvider(ctx, log)
 
-	// Seed addons only run on raw runtime clusters — managed seeds are skipped
-	// earlier in this function via isManagedSeed. So ClusterRole is always
-	// "runtime" at this point.
+	// ClusterRole is "runtime" on raw runtime/non-managed seeds. On a managed seed
+	// (reached only for deployOnManagedSeeds opt-in addons) it is "managed-seed".
+	clusterRole := "runtime"
+	if managedSeed {
+		clusterRole = "managed-seed"
+	}
 	meta := &shootMetadata{
 		Name:                      seedName,
 		SeedName:                  seedName,
 		Project:                   seedName,
 		Region:                    region,
 		ProviderType:              seedProvider,
-		ClusterRole:               "runtime",
+		ClusterRole:               clusterRole,
 		ManagedKubernetesProvider: managedK8s,
 		ControlNamespace:          extensionNS,
 	}
@@ -1559,7 +1579,7 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 	h.Write([]byte(meta.ManagedKubernetesProvider))
 	for i := range manifest.Addons {
 		addon := &manifest.Addons[i]
-		if !addon.DeploysToSeed() || !addon.Enabled {
+		if !addon.DeploysToSeed() || !addon.Enabled || (managedSeed && !addon.DeploysOnManagedSeeds()) {
 			continue
 		}
 		h.Write([]byte(addon.Name))
@@ -1588,7 +1608,7 @@ func (a *actuator) reconcileSeedAddons(ctx context.Context, log logr.Logger, nam
 	var renderErrs []error
 	for i := range manifest.Addons {
 		addon := &manifest.Addons[i]
-		if !addon.DeploysToSeed() || !addon.Enabled {
+		if !addon.DeploysToSeed() || !addon.Enabled || (managedSeed && !addon.DeploysOnManagedSeeds()) {
 			continue
 		}
 

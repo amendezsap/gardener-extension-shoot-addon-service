@@ -146,6 +146,31 @@ func TestAddonTarget(t *testing.T) {
 	}
 }
 
+func TestDeploysOnManagedSeeds(t *testing.T) {
+	tests := []struct {
+		name   string
+		target AddonTarget
+		flag   bool
+		want   bool
+	}{
+		// Only a PURE target:seed addon with the flag set opts in.
+		{"seed addon opted in", AddonTargetSeed, true, true},
+		{"seed addon not opted in", AddonTargetSeed, false, false},
+		// Global addons are never force-deployed on managed seeds (their shoot-half
+		// is already deployed there by the parent extension) — flag is ignored.
+		{"global addon flag ignored", AddonTargetGlobal, true, false},
+		{"shoot addon flag ignored", AddonTargetShoot, true, false},
+		{"controlplane addon flag ignored", AddonTargetControlPlane, true, false},
+		{"default (shoot) flag ignored", "", true, false},
+	}
+	for _, tt := range tests {
+		addon := &Addon{Target: tt.target, DeployOnManagedSeeds: tt.flag}
+		if got := addon.DeploysOnManagedSeeds(); got != tt.want {
+			t.Errorf("%s: DeploysOnManagedSeeds() = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
 func TestGetManagedResourceName(t *testing.T) {
 	tests := []struct {
 		name     string

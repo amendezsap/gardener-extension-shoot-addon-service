@@ -52,3 +52,36 @@ func TestControlPlaneManagedResourceNamesDistinct(t *testing.T) {
 		t.Fatalf("seed and shoot MR names collide: %q", shootMR)
 	}
 }
+
+// On a hibernated shoot the control-plane render must carry hibernated=true so a
+// controller chart can gate its workload to replicas:0 (its shoot-access SA token
+// is not projected while the shoot apiserver/GRM are scaled down; a replicas>0
+// controller would CrashLoopBackOff). This locks the injection contract: the
+// hibernated value is injected via extraValues (merged LAST), wins over any chart
+// default, and coexists with the renderTarget injection without disturbing it.
+func TestControlPlaneHibernatedInjection(t *testing.T) {
+	base := map[string]interface{}{
+		hibernatedValuesKey: false, // a chart default we must override when asleep
+		"replicaCount":      1,
+	}
+	for _, hibernated := range []bool{true, false} {
+		extra := map[string]interface{}{
+			renderTargetValuesKey: renderTargetControlPlane,
+			hibernatedValuesKey:   hibernated,
+		}
+		merged := mergeMaps(base, extra)
+		if got := merged[hibernatedValuesKey]; got != hibernated {
+			t.Errorf("hibernated = %v, want %v (injected extraValues must win)", got, hibernated)
+		}
+		if merged[renderTargetValuesKey] != renderTargetControlPlane {
+			t.Errorf("renderTarget lost when hibernated injected: %v", merged[renderTargetValuesKey])
+		}
+		if merged["replicaCount"] != 1 {
+			t.Errorf("replicaCount disturbed by hibernated injection: %v", merged["replicaCount"])
+		}
+		// Must not mutate the shared base map.
+		if base[hibernatedValuesKey] != false {
+			t.Errorf("base map mutated: hibernated = %v", base[hibernatedValuesKey])
+		}
+	}
+}

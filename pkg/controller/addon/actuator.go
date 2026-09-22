@@ -75,6 +75,13 @@ const (
 	renderTargetValuesKey    = "renderTarget"
 	renderTargetControlPlane = "controlplane"
 	renderTargetShoot        = "shoot"
+
+	// hibernatedValuesKey is injected into a control-plane addon's chart render so
+	// the chart can gate its workload replicas on hibernation state. When true, a
+	// controller Deployment should render replicas:0 — its shoot-access SA token is
+	// not projected while the shoot's apiserver/GRM are scaled down, so a running
+	// replica would CrashLoopBackOff. Charts that don't read it are unaffected.
+	hibernatedValuesKey = "hibernated"
 )
 
 // Legacy MR names from previous versions that need cleanup.
@@ -535,19 +542,18 @@ metadata:
 		}
 		newStatus.Addons[addon.Name] = addonStatus
 
-		// Skip deployment for hibernated shoots: the controller has nothing to
-		// act on (no shoot apiserver or nodes), and a shoot-class MR created
-		// DURING hibernation can never be applied (the shoot's GRM is scaled
-		// down), leaving it permanently unhealthy. MRs that already existed
-		// before hibernation are left untouched — their statuses froze healthy
-		// and the controller workload carries the skip-health-check annotation.
-		// The addon stays registered in newStatus so the removed-addon cleanup
-		// does not try to delete MRs while the shoot is unreachable; deployment
-		// resumes automatically on the wake-up reconcile.
-		if hibernated {
-			log.Info("Shoot is hibernated, skipping control-plane addon deployment", "addon", addon.Name)
-			continue
-		}
+		// Hibernation handling for control-plane addons: do NOT skip the
+		// control-plane deploy. An already-deployed controller Deployment left at
+		// replicas>0 CrashLoopBackOffs during hibernation, because its shoot-access
+		// SA token (minted by the token-requestor via the shoot apiserver + GRM) is
+		// no longer projected once those are scaled to 0 — the pod fails to open
+		// /var/run/secrets/kubernetes.io/serviceaccount/token. Instead we RE-RENDER
+		// the control-plane MR with hibernated=true so the chart renders replicas:0,
+		// scaling the controller down cleanly with the rest of the control plane.
+		// This runs on the hibernation-transition reconcile while GRM is still up, so
+		// the scale-down actually applies. On wake (hibernated=false) it resumes at
+		// replicaCount. The SHOOT half (RBAC MR) is still skipped below, since a
+		// shoot-class MR cannot be applied while the shoot's GRM is scaled down.
 
 		var addonOverride *config.AddonOverride
 		if cfg.Addons != nil {
@@ -557,13 +563,15 @@ metadata:
 		}
 
 		// Control-plane half: controller workload into the CP namespace on the seed.
+		// Inject hibernated so charts can gate replicas (controllers scale to 0 when asleep).
 		seedData, _, err := a.renderAddonChartWithContext(ctx, log, addon, meta, manifest, configMapValues, addonOverride,
-			map[string]interface{}{renderTargetValuesKey: renderTargetControlPlane}, meta.ControlNamespace)
+			map[string]interface{}{renderTargetValuesKey: renderTargetControlPlane, hibernatedValuesKey: hibernated}, meta.ControlNamespace)
 		if err != nil {
 			return fmt.Errorf("failed to render control-plane part for addon %s: %w", addon.Name, err)
 		}
-		// On hibernated shoots the controller can never have available replicas
-		// (no shoot to watch), so exclude its workload from GRM health checks.
+		// On hibernated shoots the controller is rendered at replicas:0 (above), so it
+		// can never have available replicas; also exclude its workload from GRM health
+		// checks so the MR does not report perpetually unhealthy during hibernation.
 		if hibernated {
 			seedData, err = skipHealthCheckForWorkloads(seedData)
 			if err != nil {
@@ -571,7 +579,7 @@ metadata:
 			}
 		}
 		seedMRName := addon.GetSeedManagedResourceName()
-		log.Info("Deploying control-plane ManagedResource", "addon", addon.Name, "managedResource", seedMRName, "targetNamespace", meta.ControlNamespace)
+		log.Info("Deploying control-plane ManagedResource", "addon", addon.Name, "managedResource", seedMRName, "targetNamespace", meta.ControlNamespace, "hibernated", hibernated)
 		if err := managedresources.CreateForSeed(ctx, a.client, ex.Namespace, seedMRName, false, seedData); err != nil {
 			return fmt.Errorf("failed to deploy control-plane ManagedResource for addon %s: %w", addon.Name, err)
 		}

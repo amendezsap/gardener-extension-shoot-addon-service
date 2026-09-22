@@ -177,6 +177,7 @@ type shootMetadata struct {
 	GCPNodeServiceAccount     string // from Infrastructure status (GCP)
 	ClusterRole               string // "runtime", "managed-seed", or "shoot"
 	ManagedKubernetesProvider string // "GKE", "EKS", "AKS", or "" for self-managed
+	ShootLabels               map[string]string // shoot metadata.labels, exposed to shootValues templates via .ShootLabels
 }
 
 // Reconcile creates/updates IAM policies, VPC endpoints, and deploys addon
@@ -2272,6 +2273,7 @@ func (a *actuator) extractShootMetadata(ctx context.Context, log logr.Logger, cl
 		GCPNodeServiceAccount:     gcpNodeSA,
 		ClusterRole:               clusterRole,
 		ManagedKubernetesProvider: "", // shoots are vanilla Kubernetes
+		ShootLabels:               shoot.Labels,
 	}, nil
 }
 
@@ -3708,9 +3710,21 @@ type templateData struct {
 	ProviderType              string
 	ClusterRole               string
 	ManagedKubernetesProvider string
+	// ShootLabels exposes the shoot's metadata.labels to shootValues templates as
+	// .ShootLabels. Always non-nil (see newTemplateData) so `index .ShootLabels "k"`
+	// on a label-less shoot (or a seed-class render) yields "" rather than panicking.
+	ShootLabels map[string]string
 }
 
 func newTemplateData(meta *shootMetadata) *templateData {
+	// Default ShootLabels to a non-nil empty map so template expressions like
+	// `{{ index .ShootLabels "cloudability.sap/env" }}` on a shoot with no labels,
+	// or a seed-class render where labels are not populated, evaluate to "" instead
+	// of failing/panicking on a nil map.
+	labels := meta.ShootLabels
+	if labels == nil {
+		labels = map[string]string{}
+	}
 	return &templateData{
 		Region:                    meta.Region,
 		SeedName:                  meta.SeedName,
@@ -3721,6 +3735,7 @@ func newTemplateData(meta *shootMetadata) *templateData {
 		ProviderType:              meta.ProviderType,
 		ClusterRole:               meta.ClusterRole,
 		ManagedKubernetesProvider: meta.ManagedKubernetesProvider,
+		ShootLabels:               labels,
 	}
 }
 
@@ -3741,7 +3756,7 @@ func newTemplateData(meta *shootMetadata) *templateData {
 // variables are matched, so a chart's own template values (e.g. "{{ .Values.foo }}")
 // are never flagged.
 var unresolvedGardenerTemplate = regexp.MustCompile(
-	`\{\{[^}]*\.(Region|SeedName|ShootName|ShootNamespace|Project|ControlNamespace|ProviderType|ClusterRole|ManagedKubernetesProvider)\b[^}]*\}\}`)
+	`\{\{[^}]*\.(Region|SeedName|ShootName|ShootNamespace|Project|ControlNamespace|ProviderType|ClusterRole|ManagedKubernetesProvider|ShootLabels)\b[^}]*\}\}`)
 
 // checkUnresolvedTemplates fails the reconcile if any string in the final merged chart
 // values still contains an unresolved Gardener template variable. Template variables are

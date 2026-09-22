@@ -305,6 +305,24 @@ Available variables:
 | `{{ .ProviderType }}` | Cloud provider type (hyperscaler) | `aws`, `gcp`, `azure`, `openstack` |
 | `{{ .ClusterRole }}` | Cluster role in the Gardener hierarchy | `runtime`, `managed-seed`, `shoot` |
 | `{{ .ManagedKubernetesProvider }}` | Cloud-managed K8s distribution on the runtime | `GKE`, `EKS`, `AKS`, or empty |
+| `{{ index .ShootLabels "<key>" }}` | The shoot's `metadata.labels` map | value of that label, or empty if unset |
+
+### `{{ .ShootLabels }}` Values
+
+`ShootLabels` exposes the shoot's `metadata.labels` so an addon can derive per-shoot
+configuration from a label set on the shoot manifest (for example an environment
+identifier). It is always a non-nil map, so referencing a label that is not set yields an
+empty string rather than an error.
+
+- Most label keys contain `/` or `.` (e.g. `cloudability.sap/env`), which are not valid Go
+  template identifiers, so use the `index` function:
+  `{{ index .ShootLabels "cloudability.sap/env" }}`.
+- A key that is a valid Go identifier can use dot access: `{{ .ShootLabels.myLabel }}`.
+- Provide a fallback for an unset label with Sprig `default`:
+  `{{ index .ShootLabels "cloudability.sap/env" | default "unknown" }}`.
+
+Only meaningful for `target: shoot` addons rendered per shoot; on seed/runtime-class
+renders the map is empty.
 
 ### `{{ .ClusterRole }}` Values
 

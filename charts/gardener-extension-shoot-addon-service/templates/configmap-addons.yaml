@@ -1,4 +1,14 @@
 {{- if .Values.addons }}
+{{- /*
+  addons.encoding: when "base64", the manifest and each values entry arrive base64-encoded and are decoded
+  here before being written to the ConfigMap. This keeps the operator-visible Extension `spec.deployment.
+  extension.values` free of raw Go-template `{{ }}` substrings (the gardener-operator >= v1.147.0 rejects any
+  template that is not `{{ .resources.<name>.data.<key> }}`; our manifest legitimately carries per-shoot
+  shootValues templates that the controller expands at reconcile time). The decoded plaintext lands in the
+  ConfigMap exactly as before, so the controller and any human reading the ConfigMap are unaffected.
+  Unset/any-other value => pass through verbatim (backward compatible with pre-encoding landscapes).
+*/ -}}
+{{- $b64 := eq (.Values.addons.encoding | default "") "base64" -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -10,10 +20,18 @@ metadata:
 data:
   {{- if .Values.addons.manifest }}
   manifest.yaml: |
+    {{- if $b64 }}
+    {{- .Values.addons.manifest | b64dec | nindent 4 }}
+    {{- else }}
     {{- .Values.addons.manifest | nindent 4 }}
+    {{- end }}
   {{- end }}
   {{- range $key, $value := .Values.addons.values }}
   {{ $key }}: |
+    {{- if $b64 }}
+    {{- $value | b64dec | nindent 4 }}
+    {{- else }}
     {{- $value | nindent 4 }}
+    {{- end }}
   {{- end }}
 {{- end }}

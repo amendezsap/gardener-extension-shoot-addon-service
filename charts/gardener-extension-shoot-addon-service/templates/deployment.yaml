@@ -24,9 +24,14 @@ spec:
         networking.resources.gardener.cloud/to-garden-virtual-garden-kube-apiserver-tcp-443: allowed
     spec:
       serviceAccountName: gardener-extension-shoot-addon-service
-      {{- with .Values.imagePullSecrets }}
+      {{- if or .Values.imagePullSecrets (and .Values.imagePullSecret .Values.imagePullSecret.dockerconfigjson) }}
       imagePullSecrets:
+        {{- with .Values.imagePullSecrets }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if and .Values.imagePullSecret .Values.imagePullSecret.dockerconfigjson }}
+        - name: {{ include "shoot-addon-service.imagePullSecretName" . }}
+        {{- end }}
       {{- end }}
       containers:
         - name: gardener-extension-shoot-addon-service

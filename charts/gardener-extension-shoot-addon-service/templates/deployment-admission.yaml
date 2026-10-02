@@ -20,9 +20,14 @@ spec:
         networking.gardener.cloud/to-dns: allowed
     spec:
       serviceAccountName: gardener-extension-shoot-addon-service
-      {{- with .Values.imagePullSecrets }}
+      {{- if or .Values.imagePullSecrets (and .Values.imagePullSecret .Values.imagePullSecret.dockerconfigjson) }}
       imagePullSecrets:
+        {{- with .Values.imagePullSecrets }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if and .Values.imagePullSecret .Values.imagePullSecret.dockerconfigjson }}
+        - name: {{ include "shoot-addon-service.imagePullSecretName" . }}
+        {{- end }}
       {{- end }}
       containers:
         - name: shoot-addon-admission

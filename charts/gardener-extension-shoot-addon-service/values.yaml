@@ -43,7 +43,19 @@ grmNamespaces:
 # Per-addon image overrides.
 addonImageOverrides: {}
 
+# imagePullSecrets: a list of {name: <existing-secret>} appended to the controller +
+# admission pod specs. Use when the extension image lives in a registry whose pull
+# secret already exists in the extension namespace.
 imagePullSecrets: []
+
+# imagePullSecret: for a PRIVATE extension-image registry where no pull secret
+# pre-exists in the (gardener-managed, ephemeral) extension namespace. Set
+# .dockerconfigjson to a base64-encoded ~/.docker/config.json; the chart renders a
+# kubernetes.io/dockerconfigjson Secret in the namespace (secret-image-pull.yaml) and
+# appends its name to the controller + admission imagePullSecrets. Public-registry
+# deployments leave this unset -> nothing renders, no behavior change.
+# imagePullSecret:
+#   dockerconfigjson: "<base64 docker config.json>"
 
 # OCI chart cache directory inside the pod filesystem.
 ociChartCacheDir: /tmp/addon-charts

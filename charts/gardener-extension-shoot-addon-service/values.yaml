@@ -76,3 +76,19 @@ ociChartCacheDir: /tmp/addon-charts
 #           [OUTPUT]
 #               Name cloudwatch_logs
 #               ...
+#
+# addons.encoding: optional. When set to "base64", `addons.manifest` and every
+# `addons.values.<file>` are expected to arrive base64-encoded and are decoded back
+# to plaintext before being written into the ConfigMap. Use this when the Extension
+# resource is validated by a gardener-operator >= v1.147.0, which rejects any Go
+# template `{{ ... }}` in spec.deployment.extension.values that is not
+# `{{ .resources.<name>.data.<key> }}`. An addon manifest legitimately carries
+# per-shoot shootValues templates that the controller expands at reconcile time;
+# encoding the manifest keeps those templates out of the operator's string scan while
+# the ConfigMap (and the controller) still see plaintext. Unset/any other value =>
+# the values are used verbatim (backward compatible). Example:
+#   addons:
+#     encoding: base64
+#     manifest: "YXBpVmVyc2lvbjogYWRkb25z..."   # base64 of the AddonManifest YAML
+#     values:
+#       values.fluent-bit.yaml: "aW1hZ2U6..."    # base64 of the values YAML
